@@ -1,0 +1,62 @@
+name: Release
+
+# A published GitHub Release with the tag vX.Y.Z starts a release. RELEASING.md has the steps.
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # No secrets and read only: it builds the files that the publish job gets, and nothing else
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+      - name: The tag is v plus __version__
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: python scripts/release_tag.py "$TAG"
+      - name: Build the wheel and the sdist
+        run: |
+          python -m pip install build==1.6.1
+          python -m build
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  # The only job that can get a PyPI identity (id-token: write). It starts when the required reviewer of the environment pypi approves,
+  # and it gets only the build job's files: no checkout, no build step
+  publish:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/project/domino-agui/
+    permissions:
+      id-token: write # PyPI's trusted publishing
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist/
+      # PyPI's trusted publishing: no token and no password
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3

@@ -1,0 +1,243 @@
+"""The agent contract's shared parts: each ready-made agent uses them, and so can an author's own graph, flow or loop, so that every
+framework calls the model, the relay and an own tool, and asks a question, the same way. The standard library only.
+
+    model = contract.model_alias()                                       # AGENT_MODEL, in the format contract.alias_format() names
+    tools = await contract.relay_tools() + run.client_tools + [contract.ASK_HUMAN_TOOL]   # AG-UI tools, for convert.to_openai()
+    system = contract.system_prompt(run.context)                         # "" when the run has no context (a laptop)
+    question, expires_at = contract.ask_human_arguments(call.arguments)  # the model's ask_human call
+    reply = payload if resolved else contract.NO_ANSWER                  # ask_human's result
+
+Own tools are plain functions that run in the agent, in the sandbox. They aren't gateway tools, so the gateway doesn't decide or
+audit them:
+
+    specs, own = contract.own_tools(tools)                               # when the entry point is built: NameClash for ask_human
+    contract.check_names(own, gateway=relay_names, client=client_names)  # in each AG-UI run, before the model call
+    result = await contract.call_tool(call.name, call.arguments, own)    # an own tool here, a gateway tool through the relay
+"""
+import asyncio
+import inspect
+import json
+import os
+import types
+import typing
+
+from .relay import Relay, ToolResult
+
+ASK_HUMAN = "ask_human"
+# ask_human, the agent's tool for a question to a person, as an AG-UI tool (name, description, parameters). The agent ends its AG-UI run
+# with one interrupt for it: the question is the interrupt's message, and expires_at its expiresAt
+ASK_HUMAN_TOOL = {"name": ASK_HUMAN, "description": "Ask the person who started the task a question, and wait for the answer.",
+                  "parameters": {"type": "object", "required": ["question"], "properties": {
+                      "question": {"type": "string", "description": "The question"},
+                      "expires_at": {"type": "string", "description": "Optional: when the answer stops being useful (ISO 8601)"}}}}
+# ask_human's result when the question expired (the resume is cancelled). It says only what happened: what the agent does then is the
+# system prompt's rule
+NO_ANSWER = "No answer came before the question expired, so it was cancelled."
+# ask_human's result for a question that the agent doesn't ask: a second one in the same answer, or one next to a client-side call. An
+# AG-UI run ends with one interrupt at most, and the ready-made handler and flow keep one open question across runs
+ONE_QUESTION = "Ask one question at a time: ask this again once you have the answer you are waiting for."
+# The relay client's timeouts, in seconds: to connect, then for each answer. A relay call can stay open for up to 45 s, so the time
+# for an answer must be at least 60 s
+CONNECT_TIMEOUT, READ_TIMEOUT = 30, 300
+
+# The framework of the Environment this runs in: each framework image sets it (an ENV line in its Dockerfile), and the sandbox keeps
+# AGENT_* variables for the agent server. Not set on a laptop
+FRAMEWORK_ENV = "AGENT_FRAMEWORK"
+
+_relay = None    # the relay client for this agent server
+_listed = None   # the relay's tools, listed once for each agent server, at the first run (no network at import)
+
+
+def require_framework(module, framework):
+    """A framework module's first step, at its import: an ImportError, which names the Environment to use, when this is the Environment
+    of another framework (FRAMEWORK_ENV names it). Nothing when it is this framework's, or not set (a laptop)."""
+    here = os.environ.get(FRAMEWORK_ENV)
+    if here and here != framework:
+        raise ImportError(f"{module} is the ready-made agent for the {framework} framework, and this is the agent-{here} Environment: "
+                          f"run the agent on the agent-{framework} Environment")
+
+
+def no_tool(name):
+    """The result of a call to a tool that no list has (not an own tool, not the relay's, not client-side). The agent answers it, with
+    no relay call."""
+    return f"There is no tool named {name}."
+
+
+def model_alias():
+    """AGENT_MODEL, the model's alias at the model gateway, read when it is called (so an agent builds with no model variables)."""
+    model = os.environ.get("AGENT_MODEL")
+    if not model:
+        raise RuntimeError("AGENT_MODEL isn't set: the platform sets it in a framework-lane Job. Elsewhere, set AGENT_MODEL to a model "
+                           "name, and AGENT_MODEL_FORMAT to anthropic or openai")
+    return model
+
+
+def alias_format():
+    """The model format of the alias: "anthropic" (Anthropic Messages) when AGENT_MODEL_FORMAT says so, else "openai" (OpenAI chat
+    completions, which OpenAI-compatible models speak too)."""
+    return "anthropic" if os.environ.get("AGENT_MODEL_FORMAT") == "anthropic" else "openai"
+
+
+def relay():
+    """The relay client for this agent server (MCP at $AGENT_SERVICE_URL/mcp, with $SESSION_TOKEN): connect timeout CONNECT_TIMEOUT,
+    read timeout READ_TIMEOUT, never through the egress proxy. None outside a Job (no AGENT_SERVICE_URL)."""
+    global _relay
+    if not os.environ.get("AGENT_SERVICE_URL"):
+        return None
+    if _relay is None:
+        _relay = Relay(timeout=CONNECT_TIMEOUT, read_timeout=READ_TIMEOUT)
+    return _relay
+
+
+async def relay_tools():
+    """Every tool the relay lists, under the relay's names, as AG-UI tools: listed at the first run, then kept (a failed listing is
+    tried again at the next run). [] outside a Job."""
+    global _listed
+    client = relay()
+    if client is None:
+        return []
+    if _listed is None:
+        _listed = await client.list_tools()
+    return _listed
+
+
+async def call_tool(name, arguments, own=None):
+    """A tool call that the agent runs, with the model's arguments (a dict or its JSON text). -> ToolResult: an own tool's (`own`:
+    {name: function}), run here with call_function; a gateway tool's (the relay lists it), through the relay; else no_tool(name), with
+    no relay call. A denial and an own tool's exception are error results too, for the model to read."""
+    if name in (own or {}):
+        return await call_function(own[name], arguments)
+    if name in {t["name"] for t in await relay_tools()}:
+        return await relay().call(name, arguments)
+    return ToolResult(no_tool(name), True)
+
+
+def own_tools(tools):
+    """The own tools (plain functions), as the entry point is built: (their AG-UI tools, {name: function}). Each AG-UI tool comes from
+    function_tool(); NameClash for one named ask_human, or two with one name (check_names)."""
+    specs = [function_tool(fn) for fn in tools]
+    check_names([s["name"] for s in specs])
+    return specs, {s["name"]: fn for s, fn in zip(specs, tools)}
+
+
+def ask_human_arguments(arguments):
+    """The model's ask_human call's arguments (a dict, or the model's JSON text) as (question, expires_at): the question's text, and
+    when its answer stops being useful (ISO 8601, or None). Arguments that aren't a JSON object are the question's text."""
+    try:
+        args = json.loads(arguments or "{}") if isinstance(arguments, str) else arguments
+    except ValueError:
+        args = None
+    if not isinstance(args, dict):
+        return str(arguments or ""), None
+    expires_at = args.get("expires_at")
+    return str(args.get("question") or ""), str(expires_at) if expires_at else None
+
+
+class NameClash(ValueError):
+    """An own tool has the name of ask_human, of a gateway tool or of a client-side tool."""
+
+
+def check_names(own, *, gateway=(), client=()):
+    """Raises NameClash when an own tool would hide another tool. `own`: the own tools' names. When the entry point is built: ask_human,
+    and two own tools with one name. In each AG-UI run, also `gateway` (the names the relay lists) and `client` (the run's client-side
+    tools, RunAgentInput.tools): an own tool must never hide a tool that the gateway decides and audits."""
+    own = list(own)
+    if ASK_HUMAN in own:
+        raise NameClash(f"an own tool is named {ASK_HUMAN}, the agent's tool that asks a person a question: rename the function")
+    twice = sorted({n for n in own if own.count(n) > 1})
+    if twice:
+        raise NameClash(f"two own tools have the name {', '.join(twice)}: give each one its own name")
+    for names, what in ((set(gateway), "a gateway tool (the relay lists it)"), (set(client), "a client-side tool of this run")):
+        hit = sorted(n for n in own if n in names)
+        if hit:
+            raise NameClash(f"the own tool {', '.join(hit)} has the name of {what}, which it would hide from the gateway's decisions "
+                            "and audit: rename the function")
+
+
+def function_tool(fn):
+    """An own tool, a plain function (def or async def), as an AG-UI tool: its name, its docstring's first paragraph as the
+    description, and a JSON schema of its parameters from their type hints."""
+    name = getattr(fn, "__name__", "")
+    if not (inspect.isfunction(fn) or inspect.ismethod(fn)) or not name.isidentifier():
+        raise TypeError(f"an own tool is a function with a name (def or async def), and {fn!r} isn't one: write it with def")
+    sig, hints = inspect.signature(fn), typing.get_type_hints(fn)
+    properties, required = {}, []
+    for p in sig.parameters.values():
+        try:
+            properties[p.name] = _schema(hints.get(p.name))
+        except (KeyError, TypeError):
+            raise TypeError(f"the own tool {name} has a parameter {p.name} of type {hints.get(p.name)!r}, which has no JSON schema here: "
+                            "give it one of str, int, float, bool, list, dict, list[X], dict[str, X], Optional[X] (X | None) or "
+                            "Literal[...]") from None
+        if p.default is p.empty:
+            required.append(p.name)
+        elif _json(p.default):
+            properties[p.name]["default"] = p.default
+    doc = (inspect.getdoc(fn) or "").split("\n\n")[0]
+    return {"name": fn.__name__, "description": " ".join(doc.split()),
+            "parameters": {"type": "object", "properties": properties, "required": required}}
+
+
+async def call_function(fn, arguments):
+    """Runs an own tool with the model's arguments (a dict, or a model's JSON text) as its keyword arguments, in this process (the
+    agent server, in the sandbox): an async def is awaited, a def runs in a thread. -> ToolResult: the answer as text (JSON when it
+    isn't a str). An exception, or arguments the function can't take, is an error answer (is_error), as a gateway denial is: the model
+    reads it, and the run goes on."""
+    name = getattr(fn, "__name__", "tool")
+    try:
+        args = json.loads(arguments) if isinstance(arguments, str) else arguments
+    except ValueError:
+        args = None
+    if not isinstance(args, dict):
+        return ToolResult(f"the own tool {name} takes its arguments as a JSON object, and got {str(arguments)[:200]}", True)
+    try:
+        inspect.signature(fn).bind(**args)
+    except TypeError as e:
+        return ToolResult(f"the own tool {name} can't take these arguments: {e}", True)
+    try:
+        result = await fn(**args) if inspect.iscoroutinefunction(fn) else await asyncio.to_thread(fn, **args)
+    except Exception as e:  # noqa: BLE001 (the model gets the error as the tool's answer)
+        return ToolResult(f"the own tool {name} raised {type(e).__name__}: {e}", True)
+    return ToolResult(result if isinstance(result, str) else json.dumps(result, default=str, ensure_ascii=False))
+
+
+def _json(value):
+    """The value is a JSON value (so it can be a schema's default)."""
+    try:
+        json.dumps(value, allow_nan=False)
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+_TYPES = {str: "string", int: "integer", float: "number", bool: "boolean", list: "array", dict: "object"}
+
+
+def _schema(hint):
+    """The JSON schema of one type hint (KeyError when it has none here)."""
+    if hint is None or hint is typing.Any:   # no hint: any JSON value
+        return {}
+    origin, args = typing.get_origin(hint) or hint, typing.get_args(hint)
+    if origin in (typing.Union, types.UnionType) and len(args) == 2 and type(None) in args:   # Optional[X], X | None: X or null
+        out = _schema(next(a for a in args if a is not type(None)))
+        if "type" in out:
+            out["type"] = [out["type"], "null"]
+        elif "enum" in out:
+            out["enum"] = out["enum"] + [None]
+        return out
+    if origin is typing.Literal:
+        kinds = {_TYPES.get(type(a)) for a in args}
+        return {**({"type": kinds.pop()} if len(kinds) == 1 and None not in kinds else {}), "enum": list(args)}
+    out = {"type": _TYPES[origin]}
+    if origin is list and args:
+        out["items"] = _schema(args[0])
+    if origin is dict and len(args) == 2:
+        out["additionalProperties"] = _schema(args[1])
+    return out
+
+
+def system_prompt(context):
+    """The model's system prompt: the `value` of each AG-UI context entry (the agent's system prompt, the platform's operating rules
+    and the task brief), in order, as one text. "" when there is none."""
+    values = (str(c.get("value") or "").strip() for c in context or [] if isinstance(c, dict))
+    return "\n\n".join(v for v in values if v)

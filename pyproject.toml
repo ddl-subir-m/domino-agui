@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "domino-agui"
+description = "AG-UI for framework agents on the Domino agent service: a ready-made agent for LangGraph, CrewAI and the Anthropic and OpenAI SDKs, and a standard-library core"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+requires-python = ">=3.10"
+dependencies = []
+dynamic = ["version"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+[project.urls]
+Source = "https://github.com/ddl-subir-m/domino-agui"
+Issues = "https://github.com/ddl-subir-m/domino-agui/issues"
+Changelog = "https://github.com/ddl-subir-m/domino-agui/blob/main/CHANGELOG.md"
+
+[tool.setuptools]
+packages = ["domino_agui"]
+
+[tool.setuptools.dynamic]
+version = {attr = "domino_agui.__version__"}
