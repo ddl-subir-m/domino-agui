@@ -21,7 +21,7 @@ ready-made agent shares: ask_human, the expired question's text, the system prom
         result = await relay.call(call.name, call.arguments)   # a denial is a result with is_error, not an exception
         run.tool_call(call.name, call.arguments, result.text, tool_call_id=call.id)
 """
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 PROTOCOL_VERSION = "1.0"
 
 from . import contract, convert  # noqa: E402
