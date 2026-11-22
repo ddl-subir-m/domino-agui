@@ -52,7 +52,7 @@ except ImportError as e:
 __all__ = ["ASKED", "MAX_TOKENS", "Model", "agent", "agent_side_tools", "answered_question", "ask_human", "call_model", "call_tool",
            "handler", "model_client", "model_format", "system_prompt"]
 
-MAX_TOKENS = 4096   # an Anthropic Messages call must give max_tokens
+MAX_TOKENS = contract.MAX_TOKENS   # each model call's output limit, unless its options give one: the contract's default
 ASKED = "asked"     # the state's key for the open ask_human call
 
 
@@ -99,12 +99,15 @@ class Model:
 async def call_model(client, messages, tools, **options):
     """One model call for AGENT_MODEL, in the client's format, with the AG-UI history and tools (through the converters). Not streamed.
     `options` go to the SDK's create() call as they are, such as max_tokens=1024: each SDK takes its own (the pinned anthropic SDK has
-    no temperature). An Anthropic call has max_tokens=MAX_TOKENS unless they give one. -> convert.Answer."""
+    no temperature). The output limit is MAX_TOKENS (contract.MAX_TOKENS) unless they give one: an Anthropic call's max_tokens, an
+    OpenAI call's max_completion_tokens (as LangChain's ChatOpenAI sends it; max_tokens in the options works too). -> convert.Answer,
+    with answer.at_limit when the answer stopped at the limit."""
     model = contract.model_alias()
     if model_format(client) == "anthropic":
         return convert.from_anthropic(await client.messages.create(**{"model": model, "max_tokens": MAX_TOKENS, **options,
                                                                       **convert.to_anthropic(messages, tools)}))
-    return convert.from_openai(await client.chat.completions.create(model=model, **options, **convert.to_openai(messages, tools)))
+    limit = {} if {"max_tokens", "max_completion_tokens"} & set(options) else {"max_completion_tokens": MAX_TOKENS}
+    return convert.from_openai(await client.chat.completions.create(model=model, **limit, **options, **convert.to_openai(messages, tools)))
 
 
 async def agent_side_tools(run):

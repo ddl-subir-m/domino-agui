@@ -84,14 +84,17 @@ def client_side(state):
     return {t["name"] for t in state.get("tools") or []}
 
 
-def chat_model():
-    """A chat model for AGENT_MODEL in AGENT_MODEL_FORMAT, made when it is called (so a graph builds with no model variables)."""
-    model = contract.model_alias()
+def chat_model(max_tokens=None):
+    """A chat model for AGENT_MODEL in AGENT_MODEL_FORMAT, made when it is called (so a graph builds with no model variables). Its
+    output limit is `max_tokens`, or contract.MAX_TOKENS (16000, or AGENT_MAX_TOKENS) when it is None: an alias with no model profile
+    would get a small default (4,096), which cuts a long answer."""
+    model, limit = contract.model_alias(), max_tokens or contract.MAX_TOKENS
     if contract.alias_format() == "anthropic":
         from langchain_anthropic import ChatAnthropic
-        return ChatAnthropic(model=model)
+        return ChatAnthropic(model=model, max_tokens=limit)
     from langchain_openai import ChatOpenAI
-    return ChatOpenAI(model=model, use_responses_api=False)   # chat completions: the format OpenAI-compatible models speak too
+    # chat completions: the format OpenAI-compatible models speak too. ChatOpenAI sends the limit as max_completion_tokens
+    return ChatOpenAI(model=model, use_responses_api=False, max_tokens=limit)
 
 
 def _direct(headers=None, timeout=None, auth=None):
