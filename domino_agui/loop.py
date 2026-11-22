@@ -184,10 +184,11 @@ def agent(model=None, tools=()):
         if client is None:
             client = model_client()
         history = system_prompt(run) + run.messages + answered_question(run)
+        retried = False   # the one retry of this AG-UI run after an empty answer
         while True:
             answer = await call_model(client, history, offered, **options)
-            asked = history[-1].get("content") == contract.EMPTY_ANSWER   # this answer came after the retry message
-            if not (answer.text.strip() or answer.tool_calls or asked):   # no text and no tool call: ask the model again
+            if not (answer.text.strip() or answer.tool_calls or retried):   # no text and no tool call: ask the model one more time
+                retried = True
                 history.append({"id": "empty-answer", "role": "user", "content": contract.EMPTY_ANSWER})
                 continue
             history.append(answer.message())

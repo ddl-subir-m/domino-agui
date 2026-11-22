@@ -129,6 +129,13 @@ def pending(state):
     return [c for c in msgs[i].tool_calls if c["id"] not in done]
 
 
+def _asked_again(state):
+    """The graph gave the model contract.EMPTY_ANSWER after the last message of a person: the last user message in the state is it. The
+    ready-made graph asks the model again one time after an empty answer, so at most one time in an AG-UI run."""
+    last = next((m for m in reversed(state["messages"]) if isinstance(m, HumanMessage)), None)
+    return last is not None and last.content == contract.EMPTY_ANSWER
+
+
 def route(state):
     """What runs next, by node name: "relay" for the open calls that run here (gateway tools and own tools), then "ask_human" for the
     question; END while client-side calls are open; else "agent" (the model) after a new message or result, or END after the model's
@@ -193,8 +200,7 @@ def agent(model=None, tools=()):
                    + list(own.values()) + [convert.openai_tool(contract.ASK_HUMAN_TOOL)])
         llm = (model or chat_model()).bind_tools(offered)
         answer = await llm.ainvoke(system_prompt(state) + state["messages"])
-        asked = state["messages"][-1].content == contract.EMPTY_ANSWER   # this answer came after the retry message
-        if not (answer.text.strip() or answer.tool_calls or asked):   # no text and no tool call: route() calls the model again
+        if not (answer.text.strip() or answer.tool_calls or _asked_again(state)):   # no text and no tool call: route() calls the model again
             return {"messages": [answer, HumanMessage(contract.EMPTY_ANSWER)]}
         return {"messages": [answer]}
 
