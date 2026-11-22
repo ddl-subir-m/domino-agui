@@ -36,6 +36,14 @@ NO_ANSWER = "No answer came before the question expired, so it was cancelled."
 # ask_human's result for a question that the agent doesn't ask: a second one in the same answer, or one next to a client-side call. An
 # AG-UI run ends with one interrupt at most, and the ready-made handler and flow keep one open question across runs
 ONE_QUESTION = "Ask one question at a time: ask this again once you have the answer you are waiting for."
+# The message that the ready-made LangGraph agent and the loop give the model after an answer with no text and no tool call, one time
+# in a run, as a user message. A second empty answer ends the run. (CrewAI's flow doesn't send it.)
+EMPTY_ANSWER = "Your last answer was empty. Continue with the task, or give your result."
+# The run's result, as its last text, when the model's last answer stopped at the output limit (MAX_TOKENS, or the limit of the
+# author's own model): the answer isn't finished, so the result says so, and says how to give the model more room. The ready-made
+# LangGraph agent and the loop send it
+AT_LIMIT = ("The model's last answer stopped at its output limit, so it is not a finished answer. To give the model a larger limit, "
+            "set AGENT_MAX_TOKENS, or max_tokens on the agent's own model.")
 # The relay client's timeouts, in seconds: to connect, then for each answer. A relay call can stay open for up to 45 s, so the time
 # for an answer must be at least 60 s
 CONNECT_TIMEOUT, READ_TIMEOUT = 30, 300
@@ -43,6 +51,24 @@ CONNECT_TIMEOUT, READ_TIMEOUT = 30, 300
 # The framework of the Environment this runs in: each framework image sets it (an ENV line in its Dockerfile), and the sandbox keeps
 # AGENT_* variables for the agent server. Not set on a laptop
 FRAMEWORK_ENV = "AGENT_FRAMEWORK"
+# The variable that sets MAX_TOKENS, in tokens (an AGENT_* variable, so the sandbox keeps it for the agent server)
+MAX_TOKENS_ENV = "AGENT_MAX_TOKENS"
+
+
+def _max_tokens():
+    """MAX_TOKENS_ENV as a whole number above 0, or 16000 when it isn't set. Another value is a ValueError, at the import."""
+    value = os.environ.get(MAX_TOKENS_ENV, "").strip()
+    if not value:
+        return 16000
+    if not (value.isascii() and value.isdigit()) or int(value) < 1:
+        raise ValueError(f"{MAX_TOKENS_ENV} is the model's output limit, a whole number of tokens above 0, and it is {value!r}")
+    return int(value)
+
+
+# The output limit of the platform's model, in tokens: each ready-made agent gives it to each model call (the loop's call_model(), the
+# LangGraph module's chat_model() and the CrewAI flow's litellm_arguments()), unless the author's own model or option sets one. A model
+# with no limit can get a small default (4,096 for an alias with no model profile), which cuts a long answer
+MAX_TOKENS = _max_tokens()
 
 _relay = None    # the relay client for this agent server
 _listed = None   # the relay's tools, listed once for each agent server, at the first run (no network at import)
