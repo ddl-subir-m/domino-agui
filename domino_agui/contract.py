@@ -317,9 +317,10 @@ FACTS_VERSION = 1
 
 def system_prompt(context):
     """The model's system prompt: the `value` of each AG-UI context entry (the agent's system prompt, the platform's operating rules
-    and the task brief), in order, as one text. "" when there is none. The task's facts (the entry FACTS) are left out: they are for
-    the agent's code (task()), and the task brief gives the model the same facts as text."""
-    values = (str(c.get("value") or "").strip() for c in context or [] if isinstance(c, dict) and c.get("description") != FACTS)
+    and the task brief), in order, as one text. "" when there is none. An entry is a dict, or an object with the two attributes
+    (AG-UI's Context), as for task(). The task's facts (the entry FACTS) are left out: they are for the agent's code (task()), and the
+    task brief gives the model the same facts as text."""
+    values = (str(value or "").strip() for description, value in (_entry(c) for c in context or []) if description != FACTS)
     return "\n\n".join(v for v in values if v)
 
 
