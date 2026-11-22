@@ -241,3 +241,51 @@ def system_prompt(context):
     and the task brief), in order, as one text. "" when there is none."""
     values = (str(c.get("value") or "").strip() for c in context or [] if isinstance(c, dict))
     return "\n\n".join(v for v in values if v)
+
+
+# The description of the AG-UI context item with the task's facts. The agent service sends it in each AG-UI run of a framework agent,
+# after the text item (the operating rules and the task brief): its value is the facts as compact JSON
+FACTS = "Domino Agents: the task's facts (JSON)"
+# The version of the facts that task() reads. A new field is an addition to this version; a rename or a removal is a new version
+FACTS_VERSION = 1
+
+
+def task(context):
+    """The task's facts, from the AG-UI run's context (run.context; in LangGraph state["ag-ui"]["context"], in CrewAI state.context),
+    as a dict, so that the agent's code reads a fact with no parse of the task brief. None when the context has no facts item (FACTS):
+    outside a Job, or with an agent service that doesn't send it. Facts of another version than FACTS_VERSION, or an item that isn't a
+    JSON object, raise a ValueError. The keys of version 1:
+
+    task            {id, key, title}
+    project         {id, name, owner}: the task's project (owner: its owner's user name, or None), or None
+    resources       the task's resources, except its project, in the task's order: {type, id, name, access, mount, from}. `access`
+                    is "read" or "write", `mount` the path in the Job (a dataset or a volume; else None), `from` why the task has it:
+                    "pinned" (the trigger's resources), "context" (the trigger's payload names it), "approval" (a person granted it) or
+                    "caller" (the call that started the task, or a message on it)
+    inputs          {name: value} for each named input of the agent: a resource {type, id, name} (a list for an input that takes
+                    more than one), a text input's text, or None
+    trigger         {id, type, name} of the subscription (type "event") or the schedule (type "schedule"), or None for a direct run
+    payload         what the task got with it: an event's payload, a schedule's {"schedule": {...}}, or a direct call's context. None
+                    when there is none, or when it was too large (then payloadOmitted is True)
+    payloadOmitted  True when the payload was left out for its size. Its entities are still in `resources` (from "context")
+    """
+    value = next((v for d, v in (_entry(c) for c in context or []) if d == FACTS), None)
+    if value is None:
+        return None
+    try:
+        facts = json.loads(value) if isinstance(value, str) else value
+    except ValueError as e:
+        raise ValueError(f"the task's facts (the AG-UI context item {FACTS!r}) are not JSON: {e}") from None
+    if not isinstance(facts, dict):
+        raise ValueError(f"the task's facts (the AG-UI context item {FACTS!r}) are not a JSON object: {str(value)[:200]}")
+    if facts.get("version") != FACTS_VERSION:
+        raise ValueError(f"the task's facts have version {facts.get('version')!r}, and this domino-agui reads version {FACTS_VERSION}: "
+                         "use a domino-agui that reads that version")
+    return facts
+
+
+def _entry(c):
+    """An AG-UI context entry as (description, value): a dict, or an object with the two attributes (AG-UI's Context)."""
+    if isinstance(c, dict):
+        return c.get("description"), c.get("value")
+    return getattr(c, "description", None), getattr(c, "value", None)

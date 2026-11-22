@@ -655,6 +655,53 @@ check("contract.system_prompt(context): the AG-UI context's values, in order, as
       contract.system_prompt(context) == "You triage alerts.\n\nRules: 1. Ask first.\n\nAlert 7.", repr(contract.system_prompt(context)))
 check("contract.system_prompt: no context (a laptop run) gives no text", contract.system_prompt([]) == "" and contract.system_prompt(None) == "",
       (contract.system_prompt([]), contract.system_prompt(None)))
+
+# --- the task's facts: the agent service sends them as JSON in a second AG-UI context item, after the text item, and contract.task()
+#     gives them to the agent's code. The facts here have the shape and the encoding that the agent service sends: version 1, compact
+#     JSON with no ASCII escapes
+FACTS = {"version": 1, "task": {"id": "task_0123", "key": "AGT-42", "title": "Scan the bundle"},
+         "project": {"id": "p-1", "name": "local-proj", "owner": "the-owner"},
+         "resources": [{"type": "dataset", "id": "ds-1", "name": "docs", "access": "read", "mount": "/mnt/data/docs", "from": "pinned"},
+                       {"type": "bundle", "id": "b-1", "name": "Zürich bundle", "access": "read", "mount": None, "from": "context"}],
+         "inputs": {"docs": {"type": "dataset", "id": "ds-1", "name": "docs"}},
+         "trigger": {"id": "tr-1", "type": "event", "name": "On a bundle"},
+         "payload": {"bundle": {"id": "b-1", "name": "Zürich bundle"}, "stage": "Approval"}, "payloadOmitted": False}
+facts_item = {"description": "Domino Agents: the task's facts (JSON)", "value": json.dumps(FACTS, separators=(",", ":"), ensure_ascii=False)}
+brief = {"description": "Domino Agents: the operating rules and the task brief", "value": "Rules: 1. Ask first.\n\nThe task: scan b-1."}
+check("contract.task(context): the task's facts, from the context item \"Domino Agents: the task's facts (JSON)\", as a dict",
+      contract.task([brief, facts_item]) == FACTS, contract.task([brief, facts_item]))
+
+
+class Context:
+    """AG-UI's Context, as a framework's bridge can give it: an object with `description` and `value`, not a dict."""
+    def __init__(self, description, value):
+        self.description, self.value = description, value
+
+
+check("contract.task: an item that is an object with `description` and `value` (AG-UI's Context) is read too",
+      contract.task([Context(**brief), Context(**facts_item)]) == FACTS)
+check("contract.task: None when the context has no facts item (an older agent service), or no context (outside a Job)",
+      contract.task([brief]) is None and contract.task([]) is None and contract.task(None) is None,
+      (contract.task([brief]), contract.task([]), contract.task(None)))
+
+
+def facts_error(value):
+    """'ValueError: <text>' when contract.task() raises one for a facts item with this value, else what happened instead."""
+    try:
+        return f"no error: {contract.task([brief, {**facts_item, 'value': value}])!r}"
+    except ValueError as e:
+        return f"ValueError: {e}"
+    except Exception as e:
+        return f"not a ValueError: {type(e).__name__}: {e}"
+
+
+why = [facts_error(json.dumps({**FACTS, "version": 2})), facts_error(json.dumps({k: v for k, v in FACTS.items() if k != "version"}))]
+check("contract.task: facts of another version raise a ValueError that names that version and the version this library reads (1)",
+      why[0].startswith("ValueError: ") and "version 2" in why[0] and "version 1" in why[0]
+      and why[1].startswith("ValueError: ") and "version None" in why[1], why)
+why = [facts_error('{"version": 1, "task": '), facts_error("[1]")]
+check("contract.task: a facts item that isn't a JSON object raises a ValueError that names the item",
+      all(w.startswith("ValueError: ") and "the task's facts" in w for w in why), why)
 got = [contract.ask_human_arguments(a) for a in ('{"question": "Close A-1?", "expires_at": "2026-11-11T09:00:00Z"}', {"question": "Why?"},
                                                    "Close it?", None)]
 check("contract.ask_human_arguments: the model's ask_human arguments (a dict, or its JSON text) as (question, expires_at); text that "
