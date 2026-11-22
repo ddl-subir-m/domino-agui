@@ -41,7 +41,7 @@ contract.require_framework(__name__, "langgraph")   # in another framework's Env
 try:   # LangGraph first, so that in another framework's image the error names it
     from langgraph.graph import END, START, MessagesState, StateGraph
     from langgraph.types import interrupt
-    from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
+    from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
     from langchain_core.tools import BaseTool, StructuredTool, ToolException
     from langchain_mcp_adapters.client import MultiServerMCPClient
     import httpx
@@ -192,7 +192,10 @@ def agent(model=None, tools=()):
         offered = ([t for t in relay if t.name not in names] + [convert.openai_tool(t) for t in state.get("tools") or []]
                    + list(own.values()) + [convert.openai_tool(contract.ASK_HUMAN_TOOL)])
         llm = (model or chat_model()).bind_tools(offered)
-        return {"messages": [await llm.ainvoke(system_prompt(state) + state["messages"])]}
+        answer = await llm.ainvoke(system_prompt(state) + state["messages"])
+        if not (answer.text.strip() or answer.tool_calls):   # no text and no tool call: route() calls the model again
+            return {"messages": [answer, HumanMessage(contract.EMPTY_ANSWER)]}
+        return {"messages": [answer]}
 
     async def call_tools(state):
         """Each open call that runs here: an own tool's in this process, a gateway tool's through the relay. ainvoke with the call
