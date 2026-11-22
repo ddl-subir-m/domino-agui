@@ -8,7 +8,8 @@ build_flow(), which agent() makes, returns a flow that calls the model and does 
 call. The platform's adapter serves it with the bridge, ag-ui-crewai: each AG-UI run starts converse(). The parts:
 - model_name(): the LiteLLM name of the model, for the alias in AGENT_MODEL, in the format of AGENT_MODEL_FORMAT: `openai/<alias>`
   (chat completions at OPENAI_BASE_URL) or `anthropic/<alias>` (Messages at ANTHROPIC_API_BASE). Each call streams, because the
-  bridge sends text and tool calls (copilotkit_stream) only for a streamed response;
+  bridge sends text and tool calls (copilotkit_stream) only for a streamed response, and has the output limit contract.MAX_TOKENS
+  (litellm_arguments()). The flow has no retry on an empty answer: CrewAI runs its own model loop;
 - relay_tools() and relay_call(): the gateway tools that the relay lists (contract.relay_tools(): MCP at $AGENT_SERVICE_URL/mcp, with
   $SESSION_TOKEN), in LiteLLM's form, and a call to one. A denial comes back as the tool's answer. Outside a Job (no AGENT_SERVICE_URL)
   there are none;

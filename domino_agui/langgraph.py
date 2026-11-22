@@ -5,9 +5,11 @@
     "framework": {"name": "langgraph", "entrypoint": "graph.py:build_graph"}
 
 build_graph(checkpointer), which agent() makes, compiles a graph that calls the model and does what each answer asks, until an answer
-has no tool call:
+has no tool call. After an empty answer (no text, no tool call), it gives the model contract.EMPTY_ANSWER and calls it again, one time in
+an AG-UI run. When the last answer stopped at the output limit, the run's last text is contract.AT_LIMIT. The parts:
 - chat_model(): the model, for the alias in AGENT_MODEL, in the format of AGENT_MODEL_FORMAT: ChatAnthropic (Anthropic Messages) or
-  ChatOpenAI (OpenAI chat completions). The base URLs and the keys come from the environment that the platform sets;
+  ChatOpenAI (OpenAI chat completions), with the output limit contract.MAX_TOKENS (chat_model(max_tokens=...) sets another). The base
+  URLs and the keys come from the environment that the platform sets;
 - relay_tools(): the gateway tools that the relay lists (MCP at $AGENT_SERVICE_URL/mcp, with $SESSION_TOKEN, the timeouts of
   contract.CONNECT_TIMEOUT and contract.READ_TIMEOUT), as LangChain tools. They run in this AG-UI run, and a denial comes back as the
   tool's answer. Outside a Job (no AGENT_SERVICE_URL) there are none;
@@ -31,6 +33,7 @@ An author who needs their own nodes builds a graph from these helpers: agent() s
 it is imported (the core doesn't), so it needs the agent-langgraph Environment's packages. It calls no host at import.
 """
 import os
+import uuid
 from datetime import timedelta
 from typing import Annotated
 
@@ -41,6 +44,7 @@ contract.require_framework(__name__, "langgraph")   # in another framework's Env
 try:   # LangGraph first, so that in another framework's image the error names it
     from langgraph.graph import END, START, MessagesState, StateGraph
     from langgraph.types import interrupt
+    from langchain_core.callbacks import adispatch_custom_event
     from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
     from langchain_core.tools import BaseTool, StructuredTool, ToolException
     from langchain_mcp_adapters.client import MultiServerMCPClient
@@ -136,6 +140,21 @@ def _asked_again(state):
     return last is not None and last.content == contract.EMPTY_ANSWER
 
 
+def _at_limit(message):
+    """The model's answer stopped at the output limit: Anthropic's stop_reason max_tokens, or OpenAI's finish_reason length, which
+    LangChain keeps in response_metadata (streamed or not)."""
+    meta = getattr(message, "response_metadata", None) or {}
+    return meta.get("stop_reason") == "max_tokens" or meta.get("finish_reason") == "length"
+
+
+async def _say(text, config):
+    """A text as the run's next message, with no model call: the bridge streams it (its manually_emit_message event), and the state keeps
+    it as an AIMessage with the same message ID."""
+    mid = f"msg-{uuid.uuid4().hex[:16]}"
+    await adispatch_custom_event("manually_emit_message", {"message_id": mid, "message": text, "role": "assistant"}, config=config)
+    return AIMessage(text, id=mid)
+
+
 def route(state):
     """What runs next, by node name: "relay" for the open calls that run here (gateway tools and own tools), then "ask_human" for the
     question; END while client-side calls are open; else "agent" (the model) after a new message or result, or END after the model's
@@ -191,17 +210,25 @@ def agent(model=None, tools=()):
     contract.check_names([t.name for t in langchain_tools])
     own = {t.name: t for t in langchain_tools}
 
-    async def call_model(state):
+    async def call_model(state, config):
         """One model call, with every tool the model can use: the relay's (without the client-side ones), the client-side ones, the own
-        tools and ask_human. An own tool with the name of a gateway tool or a client-side tool fails the run first (NameClash)."""
+        tools and ask_human. An own tool with the name of a gateway tool or a client-side tool fails the run first (NameClash).
+
+        After an answer with no text and no tool call, contract.EMPTY_ANSWER goes in the state as a user message, so route() calls the
+        model again: one time in an AG-UI run (_asked_again). When the last answer stopped at the output limit, it isn't a finished
+        answer: the run's last text, so the task's result, is contract.AT_LIMIT."""
         names, relay = client_side(state), await relay_tools()
         contract.check_names(own, gateway=[t.name for t in relay], client=names)
         offered = ([t for t in relay if t.name not in names] + [convert.openai_tool(t) for t in state.get("tools") or []]
                    + list(own.values()) + [convert.openai_tool(contract.ASK_HUMAN_TOOL)])
         llm = (model or chat_model()).bind_tools(offered)
         answer = await llm.ainvoke(system_prompt(state) + state["messages"])
-        if not (answer.text.strip() or answer.tool_calls or _asked_again(state)):   # no text and no tool call: route() calls the model again
+        if answer.tool_calls:
+            return {"messages": [answer]}
+        if not (answer.text.strip() or _asked_again(state)):   # an empty answer: route() calls the model again
             return {"messages": [answer, HumanMessage(contract.EMPTY_ANSWER)]}
+        if _at_limit(answer):   # the run's last text says that the answer isn't finished
+            return {"messages": [answer, await _say(contract.AT_LIMIT, config)]}
         return {"messages": [answer]}
 
     async def call_tools(state):

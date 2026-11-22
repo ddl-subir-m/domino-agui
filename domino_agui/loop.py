@@ -5,12 +5,13 @@ agent's entry point can be one line:
 
     "framework": {"name": "domino-agui", "entrypoint": "agent/handler.py:handler"}
 
-handler(run), which agent() makes, calls the model and does what each answer asks, until an answer has no tool call. One handler serves
-both model formats. Each AG-UI run brings the whole thread (run.messages), so it keeps nothing between runs but the open question, in
-the run's state:
+handler(run), which agent() makes, calls the model and does what each answer asks, until an answer has no tool call. After an empty
+answer (no text, no tool call), it gives the model contract.EMPTY_ANSWER and calls it again, one time in an AG-UI run. When the last
+answer stopped at the output limit, the run's last text is contract.AT_LIMIT. One handler serves both model formats. Each AG-UI run
+brings the whole thread (run.messages), so it keeps nothing between runs but the open question, in the run's state:
 - model_client(): the SDK client for AGENT_MODEL_FORMAT: AsyncAnthropic (Anthropic Messages) or AsyncOpenAI (OpenAI chat completions).
   It reads the base URL and the key from the environment that the platform sets (the Job's model proxy), and AGENT_MODEL names the
-  model. call_model() calls it through the library's converters;
+  model. call_model() calls it through the library's converters, with the output limit contract.MAX_TOKENS unless the options give one;
 - agent_side_tools(run): the gateway tools that the relay lists (contract.relay_tools(): MCP at $AGENT_SERVICE_URL/mcp, with
   $SESSION_TOKEN), without the run's client-side tools. They run in this AG-UI run, through the relay (call_tool()), and a denial comes
   back as the tool's answer. Outside a Job (no AGENT_SERVICE_URL) there are none;
@@ -160,7 +161,9 @@ def answered_question(run):
 def agent(model=None, tools=()):
     """The ready-made handler: `async def handler(run)`, the shape the domino-agui adapter serves. It calls the model with the run's
     history and every tool the model can use, sends the model's text, runs the calls of gateway tools and own tools, and calls the model
-    again, until an answer has no tool call (its text is the task's result), a client-side call ends the run, or ask_human does.
+    again, until an answer has no tool call (its text is the task's result), a client-side call ends the run, or ask_human does. After
+    an empty answer it gives the model contract.EMPTY_ANSWER and calls it again, one time in the AG-UI run; a last answer that stopped
+    at the output limit isn't a finished answer, so it sends contract.AT_LIMIT as the run's last text.
 
     The two options:
     - model: Model(client, **options), for the options of each model call (such as max_tokens), or an SDK client alone, AsyncAnthropic
@@ -208,8 +211,10 @@ def agent(model=None, tools=()):
                 return   # the run ends with the client-side calls open; the model can ask a person after their answers
             if ask:
                 return ask_human(run, ask)   # the run ends with the question
-            if not answer.tool_calls:
-                return   # the last text is the task's result
+            if not answer.tool_calls:   # the last text is the task's result
+                if answer.at_limit:   # not a finished answer: the run's last text says so
+                    run.text(contract.AT_LIMIT)
+                return
 
     return handler
 
