@@ -31,6 +31,11 @@ sandbox: they aren't gateway tools, so the gateway doesn't decide or audit them.
 
 An author who needs their own nodes builds a graph from these helpers: agent() shows how they fit. This module imports LangGraph when
 it is imported (the core doesn't), so it needs the agent-langgraph Environment's packages. It calls no host at import.
+
+A graph of its own also has:
+- finish(text): a graph whose last node is not a model call gives the task's result with it (the run's last text, streamed);
+- quiet(runnable): a model call whose answer the graph reads itself stays out of the AG-UI stream;
+- structured(model, schema): a typed answer, with no forced tool choice, one more try, and a refusal as Refused.
 """
 import os
 import uuid
@@ -44,21 +49,27 @@ contract.require_framework(__name__, "langgraph")   # in another framework's Env
 try:   # LangGraph first, so that in another framework's image the error names it
     from langgraph.graph import END, START, MessagesState, StateGraph
     from langgraph.types import interrupt
-    from langchain_core.callbacks import adispatch_custom_event
-    from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+    from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
     from langchain_core.tools import BaseTool, StructuredTool, ToolException
     from langchain_mcp_adapters.client import MultiServerMCPClient
     import httpx
     from typing_extensions import TypedDict   # as MessagesState's
+    from langchain_core.callbacks import adispatch_custom_event   # this line and the next four: finish(), structured() and agent()'s retry
+    from langchain_core.messages import HumanMessage
+    from langchain_core.runnables import RunnableLambda
+    from langchain_core.utils.function_calling import convert_to_openai_tool
+    from pydantic import BaseModel, ValidationError
 except ImportError as e:
     raise ImportError(f"domino_agui.langgraph needs LangGraph and its packages, and this Python has no {e.name or e}: run the agent on "
                       "the agent-langgraph Environment") from None
 
-__all__ = ["CANCELLED", "State", "agent", "ask_human", "build_graph", "chat_model", "client_side", "own_tool", "pending", "plain_context",
-           "relay_tools", "route", "system_prompt"]
+__all__ = ["CANCELLED", "Refused", "State", "Unusable", "agent", "ask_human", "build_graph", "chat_model", "client_side", "finish",
+           "own_tool", "pending", "plain_context", "quiet", "relay_tools", "route", "structured", "system_prompt"]
 
 # What interrupt() returns when the platform cancels the question (the bridge's sentinel)
 CANCELLED = "__agui_cancelled__"
+# The bridge's custom event that it streams as one text message (ag-ui-langgraph's CustomEventNames.ManuallyEmitMessage)
+MANUAL_MESSAGE = "manually_emit_message"
 
 _relay = None   # the relay's tools, listed once for each agent server, at the first run (no network at import)
 
@@ -147,14 +158,6 @@ def _at_limit(message):
     return meta.get("stop_reason") == "max_tokens" or meta.get("finish_reason") == "length"
 
 
-async def _say(text, config):
-    """A text as the run's next message, with no model call: the bridge streams it (its manually_emit_message event), and the state keeps
-    it as an AIMessage with the same message ID."""
-    mid = f"msg-{uuid.uuid4().hex[:16]}"
-    await adispatch_custom_event("manually_emit_message", {"message_id": mid, "message": text, "role": "assistant"}, config=config)
-    return AIMessage(text, id=mid)
-
-
 def route(state):
     """What runs next, by node name: "relay" for the open calls that run here (gateway tools and own tools), then "ask_human" for the
     question; END while client-side calls are open; else "agent" (the model) after a new message or result, or END after the model's
@@ -195,6 +198,112 @@ def own_tool(fn):
                           handle_tool_error=True)
 
 
+async def finish(text, config=None):
+    """The task's result from the graph's own last node, such as a node of plain code with no model call: `text` streamed as the run's
+    last text message, and -> the state's update with that message, {"messages": [AIMessage(text)]}. The task's result is the run's
+    last streamed text, and the bridge doesn't stream a message that a node only puts in the state. So finish() sends the bridge's
+    event manually_emit_message, with the AIMessage's ID: the stream and the state have one message. Await it in the last node, after
+    each model call: `return {**await finish(text), "verdict": verdict}`. `config`: the node's config, which Python 3.10 needs (there,
+    LangChain can't find the node's run without it)."""
+    message_id = f"msg-{uuid.uuid4().hex}"
+    await adispatch_custom_event(MANUAL_MESSAGE, {"message_id": message_id, "message": text}, config=config)
+    return {"messages": [AIMessage(text, id=message_id)]}
+
+
+def quiet(runnable):
+    """The runnable, such as a chat model or structured(), with its model calls out of the AG-UI stream: no text and no tool call of
+    them is streamed (the bridge's metadata keys emit-messages and emit-tool-calls, both False). Use it for a model call whose answer
+    the graph's own code reads: a tool call that no tool node runs would stay open in the stream. Its answer is still the runnable's
+    answer, for the node. A tool that the runnable runs with a tool call (it gives a ToolMessage) is still streamed: the bridge reads
+    no key for it."""
+    return runnable.with_config(metadata={"emit-messages": False, "emit-tool-calls": False})
+
+
+class Unusable(Exception):
+    """structured() got no value that fits its schema, also after its one more try. str() says why, and `answer` is the model's last
+    answer (an AIMessage)."""
+
+    def __init__(self, why, answer=None):
+        super().__init__(why)
+        self.answer = answer
+
+
+class Refused(Unusable):
+    """The model refused the request: stop_reason refusal (Anthropic's safeguards; stop_details has the category), or finish_reason
+    content_filter (the OpenAI format). structured() doesn't ask again, because the same request is refused again."""
+
+
+def structured(model, schema, parse=None):
+    """A typed answer from `model`, a LangChain chat model such as chat_model(): a runnable whose ainvoke(messages) gives a value of
+    `schema`. The schema is a Pydantic model class (the value is an instance, which Pydantic checks), or a JSON schema dict with a
+    "title" (the value is the dict of the call's arguments, with each key that the schema's top level requires). It is offered to the
+    model as its one tool, and the tool choice isn't forced: the newest Claude models refuse a forced one, and with_structured_output
+    forces one for a model alias such as the platform's. `parse`: your own step on the value, which returns the value to give, or
+    raises ValueError with why it doesn't fit.
+
+    The model is asked one time again, with the same messages and a short note of why, when its answer has no call of the tool, a
+    call that doesn't fit (the schema, or `parse`), no text and no tool call, or stopped at its output limit. After that, Unusable. A
+    refusal raises Refused at once.
+
+    To keep it out of the AG-UI stream: quiet(structured(model, schema)). Not structured(quiet(model), ...): bind_tools on a wrapped
+    model drops the wrapper's settings."""
+    tool = convert_to_openai_tool(schema)["function"]
+    name, limit = tool["name"], getattr(model, "max_tokens", None)
+    llm = model.bind_tools([schema])   # no tool_choice: the model picks the tool
+
+    async def ask(messages, config=None):
+        messages, note = [HumanMessage(messages)] if isinstance(messages, str) else list(messages), []
+        for again in (False, True):
+            answer = await llm.ainvoke(messages + note, config)
+            try:
+                return _value(answer, schema, tool, limit, parse)
+            except Refused:
+                raise
+            except Unusable as e:
+                if again:
+                    raise
+                note = [HumanMessage(f"Your last answer could not be used: {e}. Call {name} once, with every field.")]
+    return RunnableLambda(ask, name=f"structured_{name}")
+
+
+def _value(answer, schema, tool, limit, parse):
+    """The value in the model's answer (an AIMessage) for structured(), or Unusable (Refused for a refusal) that says why there is
+    none. `limit`: the model's max_tokens, for the text of an answer that stopped there."""
+    name, meta = tool["name"], answer.response_metadata or {}
+    if meta.get("stop_reason") == "refusal":
+        category = (meta.get("stop_details") or {}).get("category") or "none given"
+        raise Refused(f"the model refused the call (Anthropic safeguards, category {category})", answer)
+    if meta.get("finish_reason") == "content_filter":
+        raise Refused("the model refused the call (a content filter, finish_reason content_filter)", answer)
+    if meta.get("stop_reason") == "max_tokens" or meta.get("finish_reason") == "length":
+        raise Unusable("the model's answer stopped at its output limit" + (f" ({limit} tokens)" if limit else ""), answer)
+    call = next((c for c in answer.tool_calls or [] if c.get("name") == name), None)
+    if call is None:
+        if any(c.get("name") == name for c in answer.invalid_tool_calls or []):
+            raise Unusable(f"the arguments of its {name} call are not JSON", answer)
+        content = answer.content
+        text = content if isinstance(content, str) else "".join(b.get("text") or "" for b in content if isinstance(b, dict))
+        if not answer.tool_calls and not text.strip():
+            raise Unusable("the model gave an empty answer, with no text and no tool call (a refusal through the LLM Gateway's OpenAI "
+                           "route looks like this)", answer)
+        raise Unusable(f"the model's answer has no {name} call", answer)
+    value = call.get("args") or {}
+    if isinstance(schema, type) and issubclass(schema, BaseModel):
+        try:
+            value = schema.model_validate(value)
+        except ValidationError as e:
+            why = "; ".join(f"{'.'.join(map(str, err['loc'])) or 'its arguments'}: {err['msg']}" for err in e.errors()[:3])
+            raise Unusable(f"its {name} call does not fit the schema: {why}", answer) from None
+    else:
+        missing = [k for k in tool.get("parameters", {}).get("required") or [] if k not in value]
+        if missing:
+            raise Unusable(f"its {name} call lacks {', '.join(missing)}", answer)
+    try:
+        return parse(value) if parse else value
+    except ValueError as e:
+        raise Unusable(str(e), answer) from None
+
+
 def agent(model=None, tools=()):
     """The ready-made graph's entry point: build_graph(checkpointer), which compiles the graph with the checkpointer that the platform's
     adapter gives (the thread lives in the state folder). The nodes: "agent" (one model call), "relay" (the open calls of gateway
@@ -228,7 +337,7 @@ def agent(model=None, tools=()):
         if not (answer.text.strip() or _asked_again(state)):   # an empty answer: route() calls the model again
             return {"messages": [answer, HumanMessage(contract.EMPTY_ANSWER)]}
         if _at_limit(answer):   # the run's last text says that the answer isn't finished
-            return {"messages": [answer, await _say(contract.AT_LIMIT, config)]}
+            return {"messages": [answer, *(await finish(contract.AT_LIMIT, config))["messages"]]}
         return {"messages": [answer]}
 
     async def call_tools(state):
