@@ -8,7 +8,8 @@ build_flow(), which agent() makes, returns a flow that calls the model and does 
 call. The platform's adapter serves it with the bridge, ag-ui-crewai: each AG-UI run starts converse(). The parts:
 - model_name(): the LiteLLM name of the model, for the alias in AGENT_MODEL, in the format of AGENT_MODEL_FORMAT: `openai/<alias>`
   (chat completions at OPENAI_BASE_URL) or `anthropic/<alias>` (Messages at ANTHROPIC_API_BASE). Each call streams, because the
-  bridge sends text and tool calls (copilotkit_stream) only for a streamed response;
+  bridge sends text and tool calls (copilotkit_stream) only for a streamed response, and has the output limit contract.MAX_TOKENS
+  (litellm_arguments()). The flow has no retry on an empty answer: CrewAI runs its own model loop;
 - relay_tools() and relay_call(): the gateway tools that the relay lists (contract.relay_tools(): MCP at $AGENT_SERVICE_URL/mcp, with
   $SESSION_TOKEN), in LiteLLM's form, and a call to one. A denial comes back as the tool's answer. Outside a Job (no AGENT_SERVICE_URL)
   there are none;
@@ -67,16 +68,18 @@ def litellm_arguments(model=None):
     """The model and call options of a LiteLLM acompletion() call, for agent(model=...): None, model_name() (read now); a LiteLLM name,
     that name; a crewai LLM (crewai.LLM(...), or a native provider that it makes, such as OpenAICompletion), its LiteLLM name and the
     call options it sets: temperature, top_p, max_tokens, max_completion_tokens, stop, seed, presence_penalty and frequency_penalty. The
-    base URL and the key come from the environment (the Job's model proxy), never from the LLM."""
+    output limit is max_tokens=contract.MAX_TOKENS (16000, or AGENT_MAX_TOKENS) when the LLM sets neither max_tokens nor
+    max_completion_tokens. The base URL and the key come from the environment (the Job's model proxy), never from the LLM."""
+    limit = {"max_tokens": contract.MAX_TOKENS}
     if model is None:
-        return {"model": model_name()}
+        return {"model": model_name(), **limit}
     if isinstance(model, str):
-        return {"model": model}
+        return {"model": model, **limit}
     name, provider = str(model.model), getattr(model, "provider", None)
     if not getattr(model, "is_litellm", False) and provider and not name.startswith(f"{provider}/"):
         name = f"{provider}/{name}"   # a native provider keeps the name without its prefix
-    options = {k: getattr(model, k, None) for k in _CALL_OPTIONS}
-    return {"model": name, **{k: v for k, v in options.items() if v not in (None, [], "")}}
+    options = {k: v for k, v in ((k, getattr(model, k, None)) for k in _CALL_OPTIONS) if v not in (None, [], "")}
+    return {"model": name, **({} if {"max_tokens", "max_completion_tokens"} & set(options) else limit), **options}
 
 
 async def relay_tools():

@@ -45,7 +45,8 @@ certified Environment of the framework.
 
 Each ready-made agent does the same things:
 
-- It calls the model in `AGENT_MODEL`, in the format of `AGENT_MODEL_FORMAT`, through the Job's model proxy.
+- It calls the model in `AGENT_MODEL`, in the format of `AGENT_MODEL_FORMAT`, through the Job's model proxy. Each model call has an
+  output limit of 16,000 tokens (`contract.MAX_TOKENS`), or the value of `AGENT_MAX_TOKENS`.
 - It offers the model the agent-side tools that the relay lists, and runs them in the same AG-UI run. A denial comes back as the
   tool's answer, and the model reads it.
 - It offers the client-side tools of the run, and doesn't run them. A call to one ends the AG-UI run. The agent service runs the
@@ -55,6 +56,13 @@ Each ready-made agent does the same things:
 - It uses the run's context (the agent's system prompt, the platform's operating rules and the task brief) as the model's system
   prompt.
 - It loops until the model's answer has no tool call. That last text is the task's result.
+- An empty answer (no text and no tool call) doesn't end the run at once. The LangGraph graph and the loop give the model one more
+  message, `contract.EMPTY_ANSWER`: "Your last answer was empty. Continue with the task, or give your result." They do this one time
+  in a run. When the next answer is empty too, the run ends with no result. The CrewAI flow runs its own model loop, so it has the
+  output limit, but not this retry.
+- An answer that stopped at the output limit isn't a finished answer. When the last answer of the LangGraph graph or the loop stopped
+  at the limit, the run's last text, and so the task's result, is `contract.AT_LIMIT`: it says that the answer isn't finished, and
+  how to give the model a larger limit.
 
 ## The two options: `model=` and `tools=`
 
@@ -96,6 +104,20 @@ takes LangChain tools.
 The model still goes through the Job's model proxy: the base URL and the key come from the environment. Give `ChatOpenAI`
 `use_responses_api=False`, so that it uses chat completions. To limit the length of an answer, use `max_tokens`. Don't set a
 temperature: a gpt-5 model can refuse a temperature other than 1.
+
+**The output limit.** With no `model=`, each model call has the limit `contract.MAX_TOKENS`: 16,000 tokens, or the value of
+`AGENT_MAX_TOKENS` (a whole number above 0, read when the library is imported). To change the limit of the platform's model in
+LangGraph, use `chat_model(max_tokens=...)`:
+
+```python
+from domino_agui.langgraph import agent, chat_model
+
+build_graph = agent(model=chat_model(max_tokens=32000))
+```
+
+For the loop, `Model(max_tokens=32000)` keeps the platform's model and changes its limit. The CrewAI flow and the loop give the limit
+to an own model that sets none. A LangChain chat model of your own keeps its own limit: give it `max_tokens`, because a model alias
+with no model profile can get a small default (4,096 tokens), which cuts a long answer.
 
 ## Your own LangGraph graph
 
@@ -231,6 +253,10 @@ The platform sets these variables in the agent server's environment, in a Job:
 | `AGENT_SERVICE_URL` | The agent service. Its relay is MCP at `$AGENT_SERVICE_URL/mcp`: the agent-side tools. Not set outside a Job, so there are no agent-side tools on a laptop. |
 | `SESSION_TOKEN` | The relay's bearer token for this Job. |
 | `AGENT_FRAMEWORK` | The framework of the Environment. A framework module of another framework fails at its import, with an error that names the Environment to use. Not set on a laptop. |
+
+You can set one more variable in the Job's environment, for example as a project's environment variable: `AGENT_MAX_TOKENS`, the
+output limit of the ready-made agents' model calls, in tokens (`contract.MAX_TOKENS`, 16,000 when it isn't set). The sandbox keeps
+`AGENT_*` variables for the agent server. A value that isn't a whole number above 0 fails at the import, with an error that names it.
 
 The platform also sets each model SDK's base URL and key, so that each model call goes through the Job's model proxy and the model
 gateway. On a laptop, set `AGENT_MODEL`, `AGENT_MODEL_FORMAT` and your provider's key.
