@@ -635,6 +635,60 @@ check("from_anthropic: the text blocks as the text, each tool_use as a tool call
 answer = convert.from_anthropic(SDKObject(anthropic_message("Done")))
 check("from_anthropic reads the SDK's answer object too; a text answer has no tool calls", answer.text == "Done" and answer.tool_calls == (), answer)
 
+# --- the output limit: contract.MAX_TOKENS is the platform's model's default output limit, 16,000 tokens, or AGENT_MAX_TOKENS. The
+#     contract reads the variable at its import, so each case imports it in a new Python, with the standard library only
+from domino_agui import contract  # noqa: E402
+
+LIMIT = """import sys
+sys.path.insert(0, sys.argv[1])
+try:
+    from domino_agui import contract
+    print(contract.MAX_TOKENS_ENV, contract.MAX_TOKENS)
+except Exception as e:
+    print(type(e).__name__ + ": " + str(e))
+"""
+
+
+def limit_with(value):
+    """What the contract's import gives with AGENT_MAX_TOKENS set to `value` (None: not set): its name and MAX_TOKENS, or the error."""
+    env = {k: v for k, v in os.environ.items() if k != "AGENT_MAX_TOKENS"}
+    p = subprocess.run([sys.executable, "-I", "-S", "-c", LIMIT, LIB], capture_output=True, text=True,
+                       env={**env, **({"AGENT_MAX_TOKENS": value} if value is not None else {})})
+    return (p.stdout + p.stderr).strip()
+
+
+check("contract.MAX_TOKENS: 16000 when AGENT_MAX_TOKENS isn't set or is empty (contract.MAX_TOKENS_ENV names the variable)",
+      limit_with(None) == "AGENT_MAX_TOKENS 16000" and limit_with("") == "AGENT_MAX_TOKENS 16000", (limit_with(None), limit_with("")))
+check("...AGENT_MAX_TOKENS sets it, in tokens", limit_with("32000") == "AGENT_MAX_TOKENS 32000" and limit_with(" 2048 ") == "AGENT_MAX_TOKENS 2048",
+      (limit_with("32000"), limit_with(" 2048 ")))
+bad = [limit_with(v) for v in ("lots", "0", "-5", "1.5")]
+check("...a value that isn't a whole number above 0 fails at the import, with a ValueError that names the variable and the value",
+      all(b.startswith("ValueError: AGENT_MAX_TOKENS ") for b in bad) and "'lots'" in bad[0] and "'0'" in bad[1], bad)
+
+# --- an answer that stopped at the output limit: Anthropic's stop_reason max_tokens, OpenAI's finish_reason length. The other stop
+#     reasons are a finished answer
+cut = lambda answer, **stop: {**answer, **stop} if "stop_reason" in stop else {**answer, "choices": [{**answer["choices"][0], **stop}]}
+got = [convert.from_anthropic(cut(anthropic_message("The report is cu"), stop_reason="max_tokens")).at_limit,
+       convert.from_anthropic(SDKObject(cut(anthropic_message(""), stop_reason="max_tokens"))).at_limit,
+       convert.from_anthropic(anthropic_message("Done")).at_limit,
+       convert.from_anthropic(anthropic_message("", ("toolu_01", "ping", {}))).at_limit]
+check("from_anthropic: answer.at_limit is True for stop_reason max_tokens (the SDK's object too), False for end_turn and tool_use",
+      got == [True, True, False, False], got)
+got = [convert.from_openai(cut(openai_completion("The report is cu"), finish_reason="length")).at_limit,
+       convert.from_openai(SDKObject(cut(openai_completion(None), finish_reason="length"))).at_limit,
+       convert.from_openai(openai_completion("Done")).at_limit,
+       convert.from_openai(openai_completion(None, ("call_9", "ping", "{}"))).at_limit]
+check("from_openai: answer.at_limit is True for finish_reason length (the SDK's object too), False for stop and tool_calls",
+      got == [True, True, False, False], got)
+check("convert.Answer(text) is a finished answer unless it says so: at_limit is False", convert.Answer("Done").at_limit is False)
+check("contract.EMPTY_ANSWER is the message that the ready-made LangGraph agent and the loop give the model, one time in a run, after "
+      "an answer with no text and no tool call", contract.EMPTY_ANSWER == "Your last answer was empty. Continue with the task, or give "
+      "your result.", contract.EMPTY_ANSWER)
+check("contract.AT_LIMIT is the run's result when the model's last answer stopped at the output limit: it says that the answer is not "
+      "finished, and how to give the model more room", contract.AT_LIMIT == "The model's last answer stopped at its output limit, so it "
+      "is not a finished answer. To give the model a larger limit, set AGENT_MAX_TOKENS, or max_tokens on the agent's own model.",
+      contract.AT_LIMIT)
+
 # --- the agent contract's shared parts: each ready-made agent, and an author's own graph, flow or loop, uses them the same way on
 #     every framework. The expected values are written out: a model reads these texts, so a change to one is a change to the contract
 from domino_agui import contract  # noqa: E402
