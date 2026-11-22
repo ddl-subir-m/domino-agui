@@ -56,10 +56,11 @@ Each ready-made agent does the same things:
 - It uses the run's context (the agent's system prompt, the platform's operating rules and the task brief) as the model's system
   prompt. The task's facts aren't in it: they are for your code.
 - It loops until the model's answer has no tool call. That last text is the task's result.
-- An empty answer (no text and no tool call) doesn't end the run at once. The LangGraph graph and the loop give the model one more
-  message, `contract.EMPTY_ANSWER`: "Your last answer was empty. Continue with the task, or give your result." They do this one time
-  in a run. When the next answer is empty too, the run ends with no result. The CrewAI flow runs its own model loop, so it has the
-  output limit, but not this retry.
+- An empty answer (no text and no tool call) doesn't end the AG-UI run at once. The LangGraph graph and the loop give the model one
+  more message, `contract.EMPTY_ANSWER`: "Your last answer was empty. Continue with the task, or give your result." They do this one
+  time in an AG-UI run. A run that resumes after a reply is a new AG-UI run, so it can get its own retry. When the next answer is
+  empty too, the AG-UI run ends with no result. The CrewAI flow runs its own model loop, so it has the output limit, but not this
+  retry.
 - An answer that stopped at the output limit isn't a finished answer. When the last answer of the LangGraph graph or the loop stopped
   at the limit, the run's last text, and so the task's result, starts with `contract.AT_LIMIT`. That note says that the answer isn't
   finished, and how to give the model a larger limit. A blank line and the cut text come after it.

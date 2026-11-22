@@ -205,12 +205,13 @@ def own_tool(fn):
 
 
 async def finish(text, config=None):
-    """The task's result from the graph's own last node, such as a node of plain code with no model call: `text` streamed as the run's
-    last text message, and -> the state's update with that message, {"messages": [AIMessage(text)]}. The task's result is the run's
-    last streamed text, and the bridge doesn't stream a message that a node only puts in the state. So finish() sends the bridge's
-    event manually_emit_message, with the AIMessage's ID: the stream and the state have one message. Await it in the last node, after
-    each model call: `return {**await finish(text), "verdict": verdict}`. `config`: the node's config, which Python 3.10 needs (there,
-    LangChain can't find the node's run without it)."""
+    """Gives the task's result from the graph's own last node, such as a node of plain code with no model call. It streams `text` as
+    the AG-UI run's last text message. It returns the state's update with that message: {"messages": [AIMessage(text)]}.
+
+    The task's result is the run's last streamed text, and the bridge doesn't stream a message that a node only puts in the state. So
+    finish() sends the bridge's event manually_emit_message, with the AIMessage's ID: the stream and the state have one message. Await
+    it in the last node, after each model call: `return {**await finish(text), "verdict": verdict}`. `config`: the node's config,
+    which Python 3.10 needs (there, LangChain can't find the node's run without it)."""
     message_id = f"msg-{uuid.uuid4().hex}"
     await adispatch_custom_event(MANUAL_MESSAGE, {"message_id": message_id, "message": text}, config=config)
     return {"messages": [AIMessage(text, id=message_id)]}
@@ -241,15 +242,15 @@ class Refused(Unusable):
 
 def structured(model, schema, parse=None):
     """A typed answer from `model`, a LangChain chat model such as chat_model(): a runnable whose ainvoke(messages) gives a value of
-    `schema`. The schema is a Pydantic model class (the value is an instance, which Pydantic checks), or a JSON schema dict with a
-    "title" (the value is the dict of the call's arguments, with each key that the schema's top level requires). It is offered to the
-    model as its one tool, and the tool choice isn't forced: the newest Claude models refuse a forced one, and with_structured_output
-    forces one for a model alias such as the platform's. `parse`: your own step on the value, which returns the value to give, or
-    raises ValueError with why it doesn't fit.
+    `schema`. The schema is a Pydantic model class: the value is an instance, which Pydantic checks. Or it is a JSON schema dict with a
+    "title": the value is the dict of the call's arguments, with each key that the schema's top level requires. The model gets the
+    schema as its one tool, and the tool choice isn't forced. The newest Claude models refuse a forced one, and with_structured_output
+    forces one for a model alias such as the platform's. `parse`: your own step on the value. It returns the value to give, or raises
+    ValueError with why the value doesn't fit.
 
-    The model is asked one time again, with the same messages and a short note of why, when its answer has no call of the tool, a
-    call that doesn't fit (the schema, or `parse`), no text and no tool call, or stopped at its output limit. After that, Unusable. A
-    refusal raises Refused at once.
+    When the answer doesn't fit, the model is asked one time again, with the same messages and a short note of why. An answer doesn't
+    fit when it has no call of the tool, or a call that doesn't fit the schema or `parse`. It doesn't fit either when it has no text
+    and no tool call, or when it stopped at its output limit. After the second try, Unusable. A refusal raises Refused at once.
 
     To keep it out of the AG-UI stream: quiet(structured(model, schema)). Not structured(quiet(model), ...): bind_tools on a wrapped
     model drops the wrapper's settings."""

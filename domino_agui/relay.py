@@ -65,10 +65,10 @@ class ToolResult:
 
     def json(self):
         """The JSON value at the start of `text`, for the agent's code. A gateway tool answers in JSON, and a note for the model can
-        follow the JSON on the next lines (run_job adds one): the note is left out. A ValueError that shows the text's start when the
-        text doesn't start with JSON (a plain text, an empty answer, or an answer that the gateway cut for its size), or when more
-        text follows the JSON on its line ("3 rows" is a text, not the number 3). It doesn't look at `is_error`: a denial is JSON too,
-        so check is_error first, or use contract.call_json()."""
+        follow the JSON on the next lines (run_job adds one): the note is left out. It raises a ValueError when the text doesn't
+        start with JSON: a plain text, an empty answer, or an answer that the gateway cut for its size. It raises one too when more
+        text follows the JSON on its line ("3 rows" is a text, not the number 3). The error shows the start of the text. It doesn't
+        look at `is_error`: a denial is JSON too, so check is_error first, or use contract.call_json()."""
         text = self.text.lstrip()
         if not text:
             raise ValueError("the tool's answer is empty, so it is not JSON")
