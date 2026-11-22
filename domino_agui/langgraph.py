@@ -193,7 +193,8 @@ def agent(model=None, tools=()):
                    + list(own.values()) + [convert.openai_tool(contract.ASK_HUMAN_TOOL)])
         llm = (model or chat_model()).bind_tools(offered)
         answer = await llm.ainvoke(system_prompt(state) + state["messages"])
-        if not (answer.text.strip() or answer.tool_calls):   # no text and no tool call: route() calls the model again
+        asked = state["messages"][-1].content == contract.EMPTY_ANSWER   # this answer came after the retry message
+        if not (answer.text.strip() or answer.tool_calls or asked):   # no text and no tool call: route() calls the model again
             return {"messages": [answer, HumanMessage(contract.EMPTY_ANSWER)]}
         return {"messages": [answer]}
 

@@ -186,7 +186,8 @@ def agent(model=None, tools=()):
         history = system_prompt(run) + run.messages + answered_question(run)
         while True:
             answer = await call_model(client, history, offered, **options)
-            if not (answer.text.strip() or answer.tool_calls):   # no text and no tool call: ask the model again
+            asked = history[-1].get("content") == contract.EMPTY_ANSWER   # this answer came after the retry message
+            if not (answer.text.strip() or answer.tool_calls or asked):   # no text and no tool call: ask the model again
                 history.append({"id": "empty-answer", "role": "user", "content": contract.EMPTY_ANSWER})
                 continue
             history.append(answer.message())
