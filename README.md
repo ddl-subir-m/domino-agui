@@ -108,21 +108,61 @@ An agent with its own steps builds its own graph from the helpers in `domino_agu
 - **`quiet(runnable)`** keeps the model calls of a runnable (a chat model, or `structured()`) out of the AG-UI stream: no text and
   no tool call of them is streamed. Use it for a model call whose answer your own code reads. Else the stream shows a tool call that
   no tool runs. A tool that the runnable runs with a tool call is still streamed.
+- **`structured(model, schema, parse=None)`** gives a typed answer: `await structured(model, schema).ainvoke(messages)`. The schema
+  is a Pydantic model class (you get an instance, which Pydantic checks), or a JSON schema dict with a `title` (you get the dict,
+  with each key that the schema's top level requires). The model gets the schema as its one tool, and the tool choice isn't forced:
+  the newest Claude models refuse a forced tool choice, and LangChain's `with_structured_output` forces one for a model alias.
+  - When the answer doesn't fit, the model is asked one time again, with the same messages and a short note of why. An answer
+    doesn't fit when it has no call of the tool, the call doesn't fit the schema, it has no text and no tool call, or it stopped at
+    the output limit. Then `structured()` raises `Unusable`, and `str()` of it says why.
+  - A refusal (`stop_reason` refusal, or `finish_reason` content_filter) raises `Refused` (an `Unusable`) at once, with no more
+    try: the same request is refused again.
+  - `parse` is your own step on the value: it returns the value to give, or raises `ValueError` with why it doesn't fit. The model
+    is then asked again too.
+  - To keep it out of the stream, put `quiet()` outside: `quiet(structured(model, schema))`.
+
+A graph with two nodes: the model's verdict, which the graph reads itself, then the task's result from plain code.
 
 ```python
+from typing import Literal
+
+from langchain_core.messages import HumanMessage
 from langgraph.graph import END, START, StateGraph
+from pydantic import BaseModel
 
-from domino_agui.langgraph import State, finish
+from domino_agui.langgraph import State, Unusable, chat_model, finish, quiet, structured, system_prompt
 
 
-async def report(state: State):
-    return await finish("Verdict: approve")
+class Verdict(BaseModel):
+    """The verdict on the change: approve or reject, and why."""
+    verdict: Literal["approve", "reject"]
+    reason: str
+
+
+class Review(State, total=False):
+    verdict: dict
+
+
+async def judge(state: Review):
+    ask = quiet(structured(chat_model(), Verdict))
+    try:
+        got = await ask.ainvoke(system_prompt(state) + state["messages"] + [HumanMessage("Give your verdict.")])
+    except Unusable as e:   # also a refusal (Refused)
+        return {"verdict": {"verdict": "could not check", "reason": str(e)}}
+    return {"verdict": got.model_dump()}
+
+
+async def report(state: Review):
+    v = state["verdict"]
+    return await finish(f"Verdict: {v['verdict']}. {v['reason']}")
 
 
 def build_graph(checkpointer):
-    g = StateGraph(State)
+    g = StateGraph(Review)
+    g.add_node("judge", judge)
     g.add_node("report", report)
-    g.add_edge(START, "report")
+    g.add_edge(START, "judge")
+    g.add_edge("judge", "report")
     g.add_edge("report", END)
     return g.compile(checkpointer=checkpointer)
 ```
