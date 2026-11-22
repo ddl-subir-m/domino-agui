@@ -236,18 +236,19 @@ def _schema(hint):
     return out
 
 
-def system_prompt(context):
-    """The model's system prompt: the `value` of each AG-UI context entry (the agent's system prompt, the platform's operating rules
-    and the task brief), in order, as one text. "" when there is none."""
-    values = (str(c.get("value") or "").strip() for c in context or [] if isinstance(c, dict))
-    return "\n\n".join(v for v in values if v)
-
-
 # The description of the AG-UI context item with the task's facts. The agent service sends it in each AG-UI run of a framework agent,
 # after the text item (the operating rules and the task brief): its value is the facts as compact JSON
 FACTS = "Domino Agents: the task's facts (JSON)"
 # The version of the facts that task() reads. A new field is an addition to this version; a rename or a removal is a new version
 FACTS_VERSION = 1
+
+
+def system_prompt(context):
+    """The model's system prompt: the `value` of each AG-UI context entry (the agent's system prompt, the platform's operating rules
+    and the task brief), in order, as one text. "" when there is none. The task's facts (the entry FACTS) are left out: they are for
+    the agent's code (task()), and the task brief gives the model the same facts as text."""
+    values = (str(c.get("value") or "").strip() for c in context or [] if isinstance(c, dict) and c.get("description") != FACTS)
+    return "\n\n".join(v for v in values if v)
 
 
 def task(context):

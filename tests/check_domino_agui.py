@@ -702,6 +702,9 @@ check("contract.task: facts of another version raise a ValueError that names tha
 why = [facts_error('{"version": 1, "task": '), facts_error("[1]")]
 check("contract.task: a facts item that isn't a JSON object raises a ValueError that names the item",
       all(w.startswith("ValueError: ") and "the task's facts" in w for w in why), why)
+check("contract.system_prompt leaves the facts item out: the facts are for the agent's code, and the text item is for the model",
+      contract.system_prompt([brief, facts_item]) == "Rules: 1. Ask first.\n\nThe task: scan b-1."
+      and contract.system_prompt([facts_item]) == "", (contract.system_prompt([brief, facts_item]), contract.system_prompt([facts_item])))
 got = [contract.ask_human_arguments(a) for a in ('{"question": "Close A-1?", "expires_at": "2026-11-11T09:00:00Z"}', {"question": "Why?"},
                                                    "Close it?", None)]
 check("contract.ask_human_arguments: the model's ask_human arguments (a dict, or its JSON text) as (question, expires_at); text that "
