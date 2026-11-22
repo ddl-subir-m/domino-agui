@@ -47,11 +47,11 @@ NO_ANSWER = "No answer came before the question expired, so it was cancelled."
 # AG-UI run ends with one interrupt at most, and the ready-made handler and flow keep one open question across runs
 ONE_QUESTION = "Ask one question at a time: ask this again once you have the answer you are waiting for."
 # The message that the ready-made LangGraph agent and the loop give the model after an answer with no text and no tool call, one time
-# in a run, as a user message. A second empty answer ends the run. (CrewAI's flow doesn't send it.)
+# in an AG-UI run, as a user message. A second empty answer ends the AG-UI run. (CrewAI's flow doesn't send it.)
 EMPTY_ANSWER = "Your last answer was empty. Continue with the task, or give your result."
-# The run's result, as its last text, when the model's last answer stopped at the output limit (MAX_TOKENS, or the limit of the
-# author's own model): the answer isn't finished, so the result says so, and says how to give the model more room. The ready-made
-# LangGraph agent and the loop send it
+# The note at the start of the run's result when the model's last answer stopped at the output limit (MAX_TOKENS, or the limit of the
+# author's own model). The answer isn't finished, so the result says so first, and says how to give the model more room. A blank line
+# and the cut text come after it (_cut_result). The ready-made LangGraph agent and the loop send it
 AT_LIMIT = ("The model's last answer stopped at its output limit, so it is not a finished answer. To give the model a larger limit, "
             "set AGENT_MAX_TOKENS, or max_tokens on the agent's own model.")
 # The relay client's timeouts, in seconds: to connect, then for each answer. A relay call can stay open for up to 45 s, so the time
@@ -75,10 +75,23 @@ def _max_tokens():
     return int(value)
 
 
-# The output limit of the platform's model, in tokens: each ready-made agent gives it to each model call (the loop's call_model(), the
-# LangGraph module's chat_model() and the CrewAI flow's litellm_arguments()), unless the author's own model or option sets one. A model
-# with no limit can get a small default (4,096 for an alias with no model profile), which cuts a long answer
+# The output limit of the platform's model, in tokens. Each ready-made agent gives it to each model call: the loop's call_model(), the
+# LangGraph module's chat_model() and the CrewAI flow's litellm_arguments(). The author's own model or option can set another limit.
+# With no limit, an alias with no model profile gets 4,096 tokens, and that cuts a long answer
 MAX_TOKENS = _max_tokens()
+
+
+def _cut_result(text):
+    """The run's last text when the model's last answer stopped at the output limit: AT_LIMIT, a blank line, then the cut text. So
+    the task's result says first that the answer isn't finished, and keeps the partial answer. AT_LIMIT alone when there is no text."""
+    return f"{AT_LIMIT}\n\n{text}" if text.strip() else AT_LIMIT
+
+
+def _output_limit(options, key="max_tokens"):
+    """The output limit to add to a model call: {key: MAX_TOKENS}, or {} when its `options` set one (max_tokens or
+    max_completion_tokens). The loop's call_model() and the CrewAI flow's litellm_arguments() use it."""
+    return {} if {"max_tokens", "max_completion_tokens"} & set(options) else {key: MAX_TOKENS}
+
 
 _relay = None    # the relay client for this agent server
 _listed = None   # the relay's tools, listed once for each agent server, at the first run (no network at import)
@@ -317,9 +330,10 @@ FACTS_VERSION = 1
 
 def system_prompt(context):
     """The model's system prompt: the `value` of each AG-UI context entry (the agent's system prompt, the platform's operating rules
-    and the task brief), in order, as one text. "" when there is none. The task's facts (the entry FACTS) are left out: they are for
-    the agent's code (task()), and the task brief gives the model the same facts as text."""
-    values = (str(c.get("value") or "").strip() for c in context or [] if isinstance(c, dict) and c.get("description") != FACTS)
+    and the task brief), in order, as one text. "" when there is none. An entry is a dict, or an object with the two attributes
+    (AG-UI's Context), as for task(). The task's facts (the entry FACTS) are left out: they are for the agent's code (task()), and the
+    task brief gives the model the same facts as text."""
+    values = (str(value or "").strip() for description, value in (_entry(c) for c in context or []) if description != FACTS)
     return "\n\n".join(v for v in values if v)
 
 

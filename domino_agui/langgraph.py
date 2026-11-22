@@ -6,7 +6,7 @@
 
 build_graph(checkpointer), which agent() makes, compiles a graph that calls the model and does what each answer asks, until an answer
 has no tool call. After an empty answer (no text, no tool call), it gives the model contract.EMPTY_ANSWER and calls it again, one time in
-an AG-UI run. When the last answer stopped at the output limit, the run's last text is contract.AT_LIMIT. The parts:
+an AG-UI run. When the last answer stopped at the output limit, the run's last text is contract.AT_LIMIT, then the cut text. The parts:
 - chat_model(): the model, for the alias in AGENT_MODEL, in the format of AGENT_MODEL_FORMAT: ChatAnthropic (Anthropic Messages) or
   ChatOpenAI (OpenAI chat completions), with the output limit contract.MAX_TOKENS (chat_model(max_tokens=...) sets another). The base
   URLs and the keys come from the environment that the platform sets;
@@ -145,17 +145,23 @@ def pending(state):
 
 
 def _asked_again(state):
-    """The graph gave the model contract.EMPTY_ANSWER after the last message of a person: the last user message in the state is it. The
-    ready-made graph asks the model again one time after an empty answer, so at most one time in an AG-UI run."""
-    last = next((m for m in reversed(state["messages"]) if isinstance(m, HumanMessage)), None)
-    return last is not None and last.content == contract.EMPTY_ANSWER
+    """The graph gave the model contract.EMPTY_ANSWER in this AG-UI run, so it doesn't give it again: at most one time in an AG-UI run.
+    The bridge doesn't give the graph the run's ID, so the messages show where the run starts. A run starts with a person's message,
+    with the result of a client-side call (the platform sends it in a new run), or with the reply to ask_human (the resume). The graph
+    makes the other messages in the run: the model's answers, the retry message, and the results of the relay node's calls."""
+    messages, starts = state["messages"], client_side(state) | {contract.ASK_HUMAN}
+    names = {c["id"]: c["name"] for m in messages if isinstance(m, AIMessage) for c in m.tool_calls}
+    for m in reversed(messages):
+        if isinstance(m, HumanMessage):
+            return m.content == contract.EMPTY_ANSWER   # the retry message, or a person's message, which starts the run
+        if isinstance(m, ToolMessage) and names.get(m.tool_call_id) in starts:
+            return False   # a reply or a client-side result: this run starts here, with no retry yet
+    return False
 
 
 def _at_limit(message):
-    """The model's answer stopped at the output limit: Anthropic's stop_reason max_tokens, or OpenAI's finish_reason length, which
-    LangChain keeps in response_metadata (streamed or not)."""
-    meta = getattr(message, "response_metadata", None) or {}
-    return meta.get("stop_reason") == "max_tokens" or meta.get("finish_reason") == "length"
+    """The model's answer stopped at the output limit. Its stop reason is in response_metadata (streamed or not), as convert reads it."""
+    return convert._stop(getattr(message, "response_metadata", None))[0] == convert._LIMIT
 
 
 def route(state):
@@ -199,12 +205,13 @@ def own_tool(fn):
 
 
 async def finish(text, config=None):
-    """The task's result from the graph's own last node, such as a node of plain code with no model call: `text` streamed as the run's
-    last text message, and -> the state's update with that message, {"messages": [AIMessage(text)]}. The task's result is the run's
-    last streamed text, and the bridge doesn't stream a message that a node only puts in the state. So finish() sends the bridge's
-    event manually_emit_message, with the AIMessage's ID: the stream and the state have one message. Await it in the last node, after
-    each model call: `return {**await finish(text), "verdict": verdict}`. `config`: the node's config, which Python 3.10 needs (there,
-    LangChain can't find the node's run without it)."""
+    """Gives the task's result from the graph's own last node, such as a node of plain code with no model call. It streams `text` as
+    the AG-UI run's last text message. It returns the state's update with that message: {"messages": [AIMessage(text)]}.
+
+    The task's result is the run's last streamed text, and the bridge doesn't stream a message that a node only puts in the state. So
+    finish() sends the bridge's event manually_emit_message, with the AIMessage's ID: the stream and the state have one message. Await
+    it in the last node, after each model call: `return {**await finish(text), "verdict": verdict}`. `config`: the node's config,
+    which Python 3.10 needs (there, LangChain can't find the node's run without it)."""
     message_id = f"msg-{uuid.uuid4().hex}"
     await adispatch_custom_event(MANUAL_MESSAGE, {"message_id": message_id, "message": text}, config=config)
     return {"messages": [AIMessage(text, id=message_id)]}
@@ -235,15 +242,15 @@ class Refused(Unusable):
 
 def structured(model, schema, parse=None):
     """A typed answer from `model`, a LangChain chat model such as chat_model(): a runnable whose ainvoke(messages) gives a value of
-    `schema`. The schema is a Pydantic model class (the value is an instance, which Pydantic checks), or a JSON schema dict with a
-    "title" (the value is the dict of the call's arguments, with each key that the schema's top level requires). It is offered to the
-    model as its one tool, and the tool choice isn't forced: the newest Claude models refuse a forced one, and with_structured_output
-    forces one for a model alias such as the platform's. `parse`: your own step on the value, which returns the value to give, or
-    raises ValueError with why it doesn't fit.
+    `schema`. The schema is a Pydantic model class: the value is an instance, which Pydantic checks. Or it is a JSON schema dict with a
+    "title": the value is the dict of the call's arguments, with each key that the schema's top level requires. The model gets the
+    schema as its one tool, and the tool choice isn't forced. The newest Claude models refuse a forced one, and with_structured_output
+    forces one for a model alias such as the platform's. `parse`: your own step on the value. It returns the value to give, or raises
+    ValueError with why the value doesn't fit.
 
-    The model is asked one time again, with the same messages and a short note of why, when its answer has no call of the tool, a
-    call that doesn't fit (the schema, or `parse`), no text and no tool call, or stopped at its output limit. After that, Unusable. A
-    refusal raises Refused at once.
+    When the answer doesn't fit, the model is asked one time again, with the same messages and a short note of why. An answer doesn't
+    fit when it has no call of the tool, or a call that doesn't fit the schema or `parse`. It doesn't fit either when it has no text
+    and no tool call, or when it stopped at its output limit. After the second try, Unusable. A refusal raises Refused at once.
 
     To keep it out of the AG-UI stream: quiet(structured(model, schema)). Not structured(quiet(model), ...): bind_tools on a wrapped
     model drops the wrapper's settings."""
@@ -270,12 +277,13 @@ def _value(answer, schema, tool, limit, parse):
     """The value in the model's answer (an AIMessage) for structured(), or Unusable (Refused for a refusal) that says why there is
     none. `limit`: the model's max_tokens, for the text of an answer that stopped there."""
     name, meta = tool["name"], answer.response_metadata or {}
-    if meta.get("stop_reason") == "refusal":
+    stop, key = convert._stop(meta)
+    if stop == convert._REFUSAL and key == "stop_reason":   # Anthropic's safeguards: stop_details has the category
         category = (meta.get("stop_details") or {}).get("category") or "none given"
         raise Refused(f"the model refused the call (Anthropic safeguards, category {category})", answer)
-    if meta.get("finish_reason") == "content_filter":
+    if stop == convert._REFUSAL:
         raise Refused("the model refused the call (a content filter, finish_reason content_filter)", answer)
-    if meta.get("stop_reason") == "max_tokens" or meta.get("finish_reason") == "length":
+    if stop == convert._LIMIT:
         raise Unusable("the model's answer stopped at its output limit" + (f" ({limit} tokens)" if limit else ""), answer)
     call = next((c for c in answer.tool_calls or [] if c.get("name") == name), None)
     if call is None:
@@ -325,7 +333,7 @@ def agent(model=None, tools=()):
 
         After an answer with no text and no tool call, contract.EMPTY_ANSWER goes in the state as a user message, so route() calls the
         model again: one time in an AG-UI run (_asked_again). When the last answer stopped at the output limit, it isn't a finished
-        answer: the run's last text, so the task's result, is contract.AT_LIMIT."""
+        answer: the run's last text, so the task's result, is contract.AT_LIMIT, a blank line, then the cut text."""
         names, relay = client_side(state), await relay_tools()
         contract.check_names(own, gateway=[t.name for t in relay], client=names)
         offered = ([t for t in relay if t.name not in names] + [convert.openai_tool(t) for t in state.get("tools") or []]
@@ -336,8 +344,8 @@ def agent(model=None, tools=()):
             return {"messages": [answer]}
         if not (answer.text.strip() or _asked_again(state)):   # an empty answer: route() calls the model again
             return {"messages": [answer, HumanMessage(contract.EMPTY_ANSWER)]}
-        if _at_limit(answer):   # the run's last text says that the answer isn't finished
-            return {"messages": [answer, *(await finish(contract.AT_LIMIT, config))["messages"]]}
+        if _at_limit(answer):   # not a finished answer: the run's last text says so first, then has the cut text
+            return {"messages": [answer, *(await finish(contract._cut_result(answer.text), config))["messages"]]}
         return {"messages": [answer]}
 
     async def call_tools(state):

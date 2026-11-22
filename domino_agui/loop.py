@@ -7,8 +7,9 @@ agent's entry point can be one line:
 
 handler(run), which agent() makes, calls the model and does what each answer asks, until an answer has no tool call. After an empty
 answer (no text, no tool call), it gives the model contract.EMPTY_ANSWER and calls it again, one time in an AG-UI run. When the last
-answer stopped at the output limit, the run's last text is contract.AT_LIMIT. One handler serves both model formats. Each AG-UI run
-brings the whole thread (run.messages), so it keeps nothing between runs but the open question, in the run's state:
+answer stopped at the output limit, the run's last text is contract.AT_LIMIT, then the cut text. One handler serves both model
+formats. Each AG-UI run brings the whole thread (run.messages), so it keeps nothing between runs but the open question, in the run's
+state:
 - model_client(): the SDK client for AGENT_MODEL_FORMAT: AsyncAnthropic (Anthropic Messages) or AsyncOpenAI (OpenAI chat completions).
   It reads the base URL and the key from the environment that the platform sets (the Job's model proxy), and AGENT_MODEL names the
   model. call_model() calls it through the library's converters, with the output limit contract.MAX_TOKENS unless the options give one;
@@ -105,9 +106,9 @@ async def call_model(client, messages, tools, **options):
     with answer.at_limit when the answer stopped at the limit."""
     model = contract.model_alias()
     if model_format(client) == "anthropic":
-        return convert.from_anthropic(await client.messages.create(**{"model": model, "max_tokens": MAX_TOKENS, **options,
+        return convert.from_anthropic(await client.messages.create(**{"model": model, **contract._output_limit(options), **options,
                                                                       **convert.to_anthropic(messages, tools)}))
-    limit = {} if {"max_tokens", "max_completion_tokens"} & set(options) else {"max_completion_tokens": MAX_TOKENS}
+    limit = contract._output_limit(options, "max_completion_tokens")
     return convert.from_openai(await client.chat.completions.create(model=model, **limit, **options, **convert.to_openai(messages, tools)))
 
 
@@ -163,7 +164,7 @@ def agent(model=None, tools=()):
     history and every tool the model can use, sends the model's text, runs the calls of gateway tools and own tools, and calls the model
     again, until an answer has no tool call (its text is the task's result), a client-side call ends the run, or ask_human does. After
     an empty answer it gives the model contract.EMPTY_ANSWER and calls it again, one time in the AG-UI run; a last answer that stopped
-    at the output limit isn't a finished answer, so it sends contract.AT_LIMIT as the run's last text.
+    at the output limit isn't a finished answer, so the run's last text is contract.AT_LIMIT, a blank line, then the cut text.
 
     The two options:
     - model: Model(client, **options), for the options of each model call (such as max_tokens), or an SDK client alone, AsyncAnthropic
@@ -195,7 +196,8 @@ def agent(model=None, tools=()):
                 history.append({"id": "empty-answer", "role": "user", "content": contract.EMPTY_ANSWER})
                 continue
             history.append(answer.message())
-            if answer.text:
+            cut = answer.at_limit and not answer.tool_calls   # not a finished answer: its text goes in the run's last text
+            if answer.text and not cut:
                 run.text(answer.text)
             open_calls = any(c.name in client_side for c in answer.tool_calls)
             # one question at a time: the run ends with one interrupt, and a client-side call ends it first
@@ -212,8 +214,8 @@ def agent(model=None, tools=()):
             if ask:
                 return ask_human(run, ask)   # the run ends with the question
             if not answer.tool_calls:   # the last text is the task's result
-                if answer.at_limit:   # not a finished answer: the run's last text says so
-                    run.text(contract.AT_LIMIT)
+                if cut:   # it says first that the answer isn't finished, then has the cut text
+                    run.text(contract._cut_result(answer.text))
                 return
 
     return handler
