@@ -105,9 +105,9 @@ async def call_model(client, messages, tools, **options):
     with answer.at_limit when the answer stopped at the limit."""
     model = contract.model_alias()
     if model_format(client) == "anthropic":
-        return convert.from_anthropic(await client.messages.create(**{"model": model, "max_tokens": MAX_TOKENS, **options,
+        return convert.from_anthropic(await client.messages.create(**{"model": model, **contract._output_limit(options), **options,
                                                                       **convert.to_anthropic(messages, tools)}))
-    limit = {} if {"max_tokens", "max_completion_tokens"} & set(options) else {"max_completion_tokens": MAX_TOKENS}
+    limit = contract._output_limit(options, "max_completion_tokens")
     return convert.from_openai(await client.chat.completions.create(model=model, **limit, **options, **convert.to_openai(messages, tools)))
 
 

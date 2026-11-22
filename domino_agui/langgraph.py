@@ -152,10 +152,8 @@ def _asked_again(state):
 
 
 def _at_limit(message):
-    """The model's answer stopped at the output limit: Anthropic's stop_reason max_tokens, or OpenAI's finish_reason length, which
-    LangChain keeps in response_metadata (streamed or not)."""
-    meta = getattr(message, "response_metadata", None) or {}
-    return meta.get("stop_reason") == "max_tokens" or meta.get("finish_reason") == "length"
+    """The model's answer stopped at the output limit. Its stop reason is in response_metadata (streamed or not), as convert reads it."""
+    return convert._stop(getattr(message, "response_metadata", None))[0] == convert._LIMIT
 
 
 def route(state):
@@ -270,12 +268,13 @@ def _value(answer, schema, tool, limit, parse):
     """The value in the model's answer (an AIMessage) for structured(), or Unusable (Refused for a refusal) that says why there is
     none. `limit`: the model's max_tokens, for the text of an answer that stopped there."""
     name, meta = tool["name"], answer.response_metadata or {}
-    if meta.get("stop_reason") == "refusal":
+    stop, key = convert._stop(meta)
+    if stop == convert._REFUSAL and key == "stop_reason":   # Anthropic's safeguards: stop_details has the category
         category = (meta.get("stop_details") or {}).get("category") or "none given"
         raise Refused(f"the model refused the call (Anthropic safeguards, category {category})", answer)
-    if meta.get("finish_reason") == "content_filter":
+    if stop == convert._REFUSAL:
         raise Refused("the model refused the call (a content filter, finish_reason content_filter)", answer)
-    if meta.get("stop_reason") == "max_tokens" or meta.get("finish_reason") == "length":
+    if stop == convert._LIMIT:
         raise Unusable("the model's answer stopped at its output limit" + (f" ({limit} tokens)" if limit else ""), answer)
     call = next((c for c in answer.tool_calls or [] if c.get("name") == name), None)
     if call is None:

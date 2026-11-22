@@ -80,6 +80,12 @@ def _max_tokens():
 # with no limit can get a small default (4,096 for an alias with no model profile), which cuts a long answer
 MAX_TOKENS = _max_tokens()
 
+
+def _output_limit(options, key="max_tokens"):
+    """The output limit to add to a model call: {key: MAX_TOKENS}, or {} when its `options` set one (max_tokens or
+    max_completion_tokens). The loop's call_model() and the CrewAI flow's litellm_arguments() use it."""
+    return {} if {"max_tokens", "max_completion_tokens"} & set(options) else {key: MAX_TOKENS}
+
 _relay = None    # the relay client for this agent server
 _listed = None   # the relay's tools, listed once for each agent server, at the first run (no network at import)
 
