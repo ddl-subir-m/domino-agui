@@ -1012,6 +1012,13 @@ check("ToolResult.json(): an answer with no JSON at its start (a text, an empty 
 res = asyncio.run(relay.call("write_dataset_description", {"datasetId": "ds1", "description": "Alerts"}))
 check("a result with isError (a denied call) comes back as a ToolResult with is_error and the server's text, not as an exception",
       res == domino_agui.ToolResult("write_dataset_description was denied: the dataset is read-only", True), res)
+got = (asyncio.run(contract.gateway_call("get_dataset", {"datasetId": "ds3"})), received[-1],
+       asyncio.run(contract.gateway_call("write_dataset_description", '{"datasetId": "ds3", "description": "Alerts"}')))
+check("contract.gateway_call(name, arguments): a gateway tool call from the agent's own code, through the Job's relay "
+      "($AGENT_SERVICE_URL, $SESSION_TOKEN): the relay's ToolResult, and a denial is a result with is_error",
+      got[0] == domino_agui.ToolResult('{"id": "ds3"}\n1 row') and without_id([got[1]]) == [
+          ("/mcp", f"Bearer {TOKEN}", {"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "get_dataset", "arguments": {"datasetId": "ds3"}}})]
+      and got[2] == domino_agui.ToolResult("write_dataset_description was denied: the dataset is read-only", True), got)
 before = len(received)
 bad = [asyncio.run(relay.call("get_dataset", a)) for a in ('{"datasetId": ', '["ds1"]')]
 check("arguments that are not a JSON object: an error result that tells the model to send a JSON object, and no request goes out",
@@ -1043,6 +1050,11 @@ check("a server that can't be reached (nothing listens) raises RelayError that n
       why.startswith("RelayError: ") and f"http://127.0.0.1:{closed_port}/mcp" in why and "can't be reached" in why, why)
 for k in ("AGENT_SERVICE_URL", "SESSION_TOKEN"):
     os.environ.pop(k)
+why = relay_error(lambda: contract.gateway_call("get_bundle", {"bundleId": "b1"}))
+check("outside a Job (no $AGENT_SERVICE_URL: a laptop, a unit test), contract.gateway_call() raises RelayError, a RuntimeError, that "
+      "names AGENT_SERVICE_URL (not an AttributeError), and relay() is still None",
+      why.startswith("RelayError: ") and "AGENT_SERVICE_URL" in why and issubclass(domino_agui.RelayError, RuntimeError)
+      and contract.relay() is None, why)
 why = relay_error(lambda: domino_agui.Relay().list_tools())
 check("with no $AGENT_SERVICE_URL and no $SESSION_TOKEN (outside a Job), making the client raises RelayError that names both and says "
       "to give url= and token=", why.startswith("RelayError: ") and "AGENT_SERVICE_URL and SESSION_TOKEN" in why

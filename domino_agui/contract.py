@@ -21,7 +21,7 @@ import os
 import types
 import typing
 
-from .relay import Relay, ToolResult
+from .relay import Relay, RelayError, ToolResult
 
 ASK_HUMAN = "ask_human"
 # ask_human, the agent's tool for a question to a person, as an AG-UI tool (name, description, parameters). The agent ends its AG-UI run
@@ -80,7 +80,8 @@ def alias_format():
 
 def relay():
     """The relay client for this agent server (MCP at $AGENT_SERVICE_URL/mcp, with $SESSION_TOKEN): connect timeout CONNECT_TIMEOUT,
-    read timeout READ_TIMEOUT, never through the egress proxy. None outside a Job (no AGENT_SERVICE_URL)."""
+    read timeout READ_TIMEOUT, never through the egress proxy. None outside a Job (no AGENT_SERVICE_URL): there, gateway_call() and
+    call_json() raise a RelayError that says so."""
     global _relay
     if not os.environ.get("AGENT_SERVICE_URL"):
         return None
@@ -110,6 +111,19 @@ async def call_tool(name, arguments, own=None):
     if name in {t["name"] for t in await relay_tools()}:
         return await relay().call(name, arguments)
     return ToolResult(no_tool(name), True)
+
+
+async def gateway_call(name, arguments):
+    """A gateway tool call from the agent's own code (a node of its own graph, a step of its own flow), through the Job's relay.
+    `arguments`: a dict, or its JSON text. -> the relay's ToolResult: a denial or a failed call is a result with is_error, as for the
+    model. Outside a Job (no AGENT_SERVICE_URL: a laptop, a unit test) there is no relay, so it raises RelayError, which names the
+    setting."""
+    client = relay()
+    if client is None:
+        raise RelayError("AGENT_SERVICE_URL isn't set, so there is no relay for the gateway tools: the platform sets it in the Job of a "
+                         "framework agent. Elsewhere (a laptop, a unit test), give your code a stand-in for the call, or call a relay "
+                         "that you run with Relay(url=..., token=...)")
+    return await client.call(name, arguments)
 
 
 def own_tools(tools):
