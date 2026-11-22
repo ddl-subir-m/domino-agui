@@ -126,6 +126,28 @@ async def gateway_call(name, arguments):
     return await client.call(name, arguments)
 
 
+class ToolError(RuntimeError):
+    """A gateway tool answered with an error (a denial, or a call that failed): call_json() raises it. `name` is the tool, and `result`
+    its ToolResult (result.text: the gateway's text, which says why)."""
+
+    def __init__(self, name, result):
+        super().__init__(f"the gateway tool {name} answered with an error: {result.text}")
+        self.name, self.result = name, result
+
+
+async def call_json(name, arguments):
+    """A gateway tool call from the agent's own code that gives the JSON of the answer (ToolResult.json(): a note after the JSON is
+    left out). `arguments`: a dict, or its JSON text. A denial or a failed call raises ToolError, an answer that isn't JSON a
+    ValueError that names the tool, and a call outside a Job a RelayError (as gateway_call())."""
+    result = await gateway_call(name, arguments)
+    if result.is_error:
+        raise ToolError(name, result)
+    try:
+        return result.json()
+    except ValueError as e:
+        raise ValueError(f"{name}: {e}") from None
+
+
 def own_tools(tools):
     """The own tools (plain functions), as the entry point is built: (their AG-UI tools, {name: function}). Each AG-UI tool comes from
     function_tool(); NameClash for one named ask_human, or two with one name (check_names)."""

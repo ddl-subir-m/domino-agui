@@ -65,17 +65,20 @@ class ToolResult:
 
     def json(self):
         """The JSON value at the start of `text`, for the agent's code. A gateway tool answers in JSON, and a note for the model can
-        follow the JSON (run_job adds one): the note is left out. A ValueError that shows the text's start when the text doesn't start
-        with JSON (a plain text, an empty answer, or an answer that the gateway cut for its size). It doesn't look at `is_error`: a
-        denial is JSON too, so check is_error first, or use contract.call_json()."""
+        follow the JSON on the next lines (run_job adds one): the note is left out. A ValueError that shows the text's start when the
+        text doesn't start with JSON (a plain text, an empty answer, or an answer that the gateway cut for its size), or when more
+        text follows the JSON on its line ("3 rows" is a text, not the number 3). It doesn't look at `is_error`: a denial is JSON too,
+        so check is_error first, or use contract.call_json()."""
         text = self.text.lstrip()
         if not text:
             raise ValueError("the tool's answer is empty, so it is not JSON")
+        more = f" ... ({len(text)} characters)" if len(text) > 200 else ""
         try:
-            value, _ = json.JSONDecoder().raw_decode(text)
+            value, end = json.JSONDecoder().raw_decode(text)
         except ValueError as e:
-            more = f" ... ({len(text)} characters)" if len(text) > 200 else ""
             raise ValueError(f"the tool's answer is not JSON at its start ({e}): {text[:200]!r}{more}") from None
+        if text[end:].lstrip(" \t\r")[:1] not in ("", "\n"):
+            raise ValueError(f"the tool's answer is not JSON: more text follows the JSON on its line: {text[:200]!r}{more}")
         return value
 
 
