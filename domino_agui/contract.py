@@ -13,6 +13,16 @@ audit them:
     specs, own = contract.own_tools(tools)                               # when the entry point is built: NameClash for ask_human
     contract.check_names(own, gateway=relay_names, client=client_names)  # in each AG-UI run, before the model call
     result = await contract.call_tool(call.name, call.arguments, own)    # an own tool here, a gateway tool through the relay
+
+The agent's own code (a node of its own graph, a step of its own flow) reads the task's facts, and calls a gateway tool, with no parse
+of a text that is written for a model:
+
+    facts = contract.task(run.context)                                   # a dict, or None outside a Job (no facts item)
+    bundle = await contract.call_json("get_bundle", {"bundleId": bundle_id})   # the answer's JSON; ToolError for a denial
+    result = await contract.gateway_call("get_bundle", {"bundleId": bundle_id})   # the ToolResult, with is_error for a denial
+    data = result.json()                                                 # the JSON at the start of the answer (a note can follow)
+
+Outside a Job (no AGENT_SERVICE_URL) there is no relay: gateway_call() and call_json() raise a RelayError that names the setting.
 """
 import asyncio
 import inspect
@@ -293,6 +303,7 @@ def task(context):
     outside a Job, or with an agent service that doesn't send it. Facts of another version than FACTS_VERSION, or an item that isn't a
     JSON object, raise a ValueError. The keys of version 1:
 
+    version         1 (FACTS_VERSION)
     task            {id, key, title}
     project         {id, name, owner}: the task's project (owner: its owner's user name, or None), or None
     resources       the task's resources, except its project, in the task's order: {type, id, name, access, mount, from}. `access`

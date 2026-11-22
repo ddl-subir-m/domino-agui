@@ -53,7 +53,7 @@ Each ready-made agent does the same things:
 - It offers `ask_human`, the agent's tool for a question to a person. The AG-UI run ends with one interrupt, and the reply is the
   tool's result.
 - It uses the run's context (the agent's system prompt, the platform's operating rules and the task brief) as the model's system
-  prompt.
+  prompt. The task's facts aren't in it: they are for your code.
 - It loops until the model's answer has no tool call. That last text is the task's result.
 
 ## The two options: `model=` and `tools=`
@@ -149,6 +149,48 @@ curl -sN --unix-socket agent.sock http://agent/agent -H 'Content-Type: applicati
 ```
 
 The answer is the run's AG-UI events, one per `data:` line.
+
+## The task's facts and gateway calls from your code
+
+Your own graph, flow or handler can read the task's facts, and call a gateway tool from its code, with no parse of the task brief.
+The agent service sends the facts in each AG-UI run, as JSON in a second context item. `contract.task(context)` gives them as a
+dict:
+
+```python
+from domino_agui import contract
+
+facts = contract.task(run.context)   # LangGraph: state["ag-ui"]["context"]; CrewAI: state.context
+bundle = next(r for r in facts["resources"] if r["type"] == "bundle")
+docs = next(r for r in facts["resources"] if r["from"] == "pinned")   # a resource of the trigger, with its mount
+```
+
+- The facts have `version` 1, `task` (`id`, `key`, `title`), `project` (`id`, `name`, `owner`), `resources` (each with `type`,
+  `id`, `name`, `access`, `mount` and `from`), `inputs`, `trigger` (`id`, `type`, `name`; None for a direct run), `payload` (the
+  trigger's payload) and `payloadOmitted` (True when the payload was too large to send). The docstring of `contract.task()` says what
+  each one holds.
+- A new field is an addition to version 1. Facts of another version raise a `ValueError` that names the version.
+- Outside a Job, or with an agent service that doesn't send them, there are no facts: `task()` gives None.
+- `contract.system_prompt()` leaves the facts out. The task brief gives the model the same facts as text.
+
+To call a gateway tool from your code, use `contract.call_json()` for the JSON of its answer, or `contract.gateway_call()` for its
+`ToolResult`:
+
+```python
+found = await contract.call_json("get_bundle", {"bundleId": bundle["id"]})   # a dict
+
+result = await contract.gateway_call("get_bundle", {"bundleId": bundle["id"]})
+if not result.is_error:   # is_error: a denial, or a call that failed
+    found = result.json()
+```
+
+- Each call goes through the gateway's decision and audit, as the model's calls do.
+- `ToolResult.json()` gives the JSON at the start of the answer. A note for the model can follow the JSON on the next lines
+  (`run_job` adds one): `json()` leaves it out. An answer that isn't JSON raises a `ValueError`. A denial is JSON too, so look at
+  `is_error` first.
+- `call_json()` raises `contract.ToolError` for a denial or a failed call. Its text has the gateway's text, `e.name` is the tool and
+  `e.result` is the `ToolResult`.
+- Outside a Job (no `AGENT_SERVICE_URL`), there is no relay: `gateway_call()` and `call_json()` raise a `RelayError` that names
+  `AGENT_SERVICE_URL`. In a unit test, give your code a stand-in for the call.
 
 ## The agent contract
 
