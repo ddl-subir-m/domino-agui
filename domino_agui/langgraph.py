@@ -5,9 +5,11 @@
     "framework": {"name": "langgraph", "entrypoint": "graph.py:build_graph"}
 
 build_graph(checkpointer), which agent() makes, compiles a graph that calls the model and does what each answer asks, until an answer
-has no tool call:
+has no tool call. After an empty answer (no text, no tool call), it gives the model contract.EMPTY_ANSWER and calls it again, one time in
+an AG-UI run. When the last answer stopped at the output limit, the run's last text is contract.AT_LIMIT, then the cut text. The parts:
 - chat_model(): the model, for the alias in AGENT_MODEL, in the format of AGENT_MODEL_FORMAT: ChatAnthropic (Anthropic Messages) or
-  ChatOpenAI (OpenAI chat completions). The base URLs and the keys come from the environment that the platform sets;
+  ChatOpenAI (OpenAI chat completions), with the output limit contract.MAX_TOKENS (chat_model(max_tokens=...) sets another). The base
+  URLs and the keys come from the environment that the platform sets;
 - relay_tools(): the gateway tools that the relay lists (MCP at $AGENT_SERVICE_URL/mcp, with $SESSION_TOKEN, the timeouts of
   contract.CONNECT_TIMEOUT and contract.READ_TIMEOUT), as LangChain tools. They run in this AG-UI run, and a denial comes back as the
   tool's answer. Outside a Job (no AGENT_SERVICE_URL) there are none;
@@ -29,8 +31,14 @@ sandbox: they aren't gateway tools, so the gateway doesn't decide or audit them.
 
 An author who needs their own nodes builds a graph from these helpers: agent() shows how they fit. This module imports LangGraph when
 it is imported (the core doesn't), so it needs the agent-langgraph Environment's packages. It calls no host at import.
+
+A graph of its own also has:
+- finish(text): a graph whose last node is not a model call gives the task's result with it (the run's last text, streamed);
+- quiet(runnable): a model call whose answer the graph reads itself stays out of the AG-UI stream;
+- structured(model, schema): a typed answer, with no forced tool choice, one more try, and a refusal as Refused.
 """
 import os
+import uuid
 from datetime import timedelta
 from typing import Annotated
 
@@ -46,15 +54,22 @@ try:   # LangGraph first, so that in another framework's image the error names i
     from langchain_mcp_adapters.client import MultiServerMCPClient
     import httpx
     from typing_extensions import TypedDict   # as MessagesState's
+    from langchain_core.callbacks import adispatch_custom_event   # this line and the next four: finish(), structured() and agent()'s retry
+    from langchain_core.messages import HumanMessage
+    from langchain_core.runnables import RunnableLambda
+    from langchain_core.utils.function_calling import convert_to_openai_tool
+    from pydantic import BaseModel, ValidationError
 except ImportError as e:
     raise ImportError(f"domino_agui.langgraph needs LangGraph and its packages, and this Python has no {e.name or e}: run the agent on "
                       "the agent-langgraph Environment") from None
 
-__all__ = ["CANCELLED", "State", "agent", "ask_human", "build_graph", "chat_model", "client_side", "own_tool", "pending", "plain_context",
-           "relay_tools", "route", "system_prompt"]
+__all__ = ["CANCELLED", "Refused", "State", "Unusable", "agent", "ask_human", "build_graph", "chat_model", "client_side", "finish",
+           "own_tool", "pending", "plain_context", "quiet", "relay_tools", "route", "structured", "system_prompt"]
 
 # What interrupt() returns when the platform cancels the question (the bridge's sentinel)
 CANCELLED = "__agui_cancelled__"
+# The bridge's custom event that it streams as one text message (ag-ui-langgraph's CustomEventNames.ManuallyEmitMessage)
+MANUAL_MESSAGE = "manually_emit_message"
 
 _relay = None   # the relay's tools, listed once for each agent server, at the first run (no network at import)
 
@@ -84,14 +99,17 @@ def client_side(state):
     return {t["name"] for t in state.get("tools") or []}
 
 
-def chat_model():
-    """A chat model for AGENT_MODEL in AGENT_MODEL_FORMAT, made when it is called (so a graph builds with no model variables)."""
-    model = contract.model_alias()
+def chat_model(max_tokens=None):
+    """A chat model for AGENT_MODEL in AGENT_MODEL_FORMAT, made when it is called (so a graph builds with no model variables). Its
+    output limit is `max_tokens`, or contract.MAX_TOKENS (16000, or AGENT_MAX_TOKENS) when it is None: an alias with no model profile
+    would get a small default (4,096), which cuts a long answer."""
+    model, limit = contract.model_alias(), max_tokens or contract.MAX_TOKENS
     if contract.alias_format() == "anthropic":
         from langchain_anthropic import ChatAnthropic
-        return ChatAnthropic(model=model)
+        return ChatAnthropic(model=model, max_tokens=limit)
     from langchain_openai import ChatOpenAI
-    return ChatOpenAI(model=model, use_responses_api=False)   # chat completions: the format OpenAI-compatible models speak too
+    # chat completions: the format OpenAI-compatible models speak too. ChatOpenAI sends the limit as max_completion_tokens
+    return ChatOpenAI(model=model, use_responses_api=False, max_tokens=limit)
 
 
 def _direct(headers=None, timeout=None, auth=None):
@@ -124,6 +142,26 @@ def pending(state):
         return []
     done = {m.tool_call_id for m in msgs[i + 1:] if isinstance(m, ToolMessage)}
     return [c for c in msgs[i].tool_calls if c["id"] not in done]
+
+
+def _asked_again(state):
+    """The graph gave the model contract.EMPTY_ANSWER in this AG-UI run, so it doesn't give it again: at most one time in an AG-UI run.
+    The bridge doesn't give the graph the run's ID, so the messages show where the run starts. A run starts with a person's message,
+    with the result of a client-side call (the platform sends it in a new run), or with the reply to ask_human (the resume). The graph
+    makes the other messages in the run: the model's answers, the retry message, and the results of the relay node's calls."""
+    messages, starts = state["messages"], client_side(state) | {contract.ASK_HUMAN}
+    names = {c["id"]: c["name"] for m in messages if isinstance(m, AIMessage) for c in m.tool_calls}
+    for m in reversed(messages):
+        if isinstance(m, HumanMessage):
+            return m.content == contract.EMPTY_ANSWER   # the retry message, or a person's message, which starts the run
+        if isinstance(m, ToolMessage) and names.get(m.tool_call_id) in starts:
+            return False   # a reply or a client-side result: this run starts here, with no retry yet
+    return False
+
+
+def _at_limit(message):
+    """The model's answer stopped at the output limit. Its stop reason is in response_metadata (streamed or not), as convert reads it."""
+    return convert._stop(getattr(message, "response_metadata", None))[0] == convert._LIMIT
 
 
 def route(state):
@@ -166,6 +204,114 @@ def own_tool(fn):
                           handle_tool_error=True)
 
 
+async def finish(text, config=None):
+    """Gives the task's result from the graph's own last node, such as a node of plain code with no model call. It streams `text` as
+    the AG-UI run's last text message. It returns the state's update with that message: {"messages": [AIMessage(text)]}.
+
+    The task's result is the run's last streamed text, and the bridge doesn't stream a message that a node only puts in the state. So
+    finish() sends the bridge's event manually_emit_message, with the AIMessage's ID: the stream and the state have one message. Await
+    it in the last node, after each model call: `return {**await finish(text), "verdict": verdict}`. `config`: the node's config,
+    which Python 3.10 needs (there, LangChain can't find the node's run without it)."""
+    message_id = f"msg-{uuid.uuid4().hex}"
+    await adispatch_custom_event(MANUAL_MESSAGE, {"message_id": message_id, "message": text}, config=config)
+    return {"messages": [AIMessage(text, id=message_id)]}
+
+
+def quiet(runnable):
+    """The runnable, such as a chat model or structured(), with its model calls out of the AG-UI stream: no text and no tool call of
+    them is streamed (the bridge's metadata keys emit-messages and emit-tool-calls, both False). Use it for a model call whose answer
+    the graph's own code reads: a tool call that no tool node runs would stay open in the stream. Its answer is still the runnable's
+    answer, for the node. A tool that the runnable runs with a tool call (it gives a ToolMessage) is still streamed: the bridge reads
+    no key for it."""
+    return runnable.with_config(metadata={"emit-messages": False, "emit-tool-calls": False})
+
+
+class Unusable(Exception):
+    """structured() got no value that fits its schema, also after its one more try. str() says why, and `answer` is the model's last
+    answer (an AIMessage)."""
+
+    def __init__(self, why, answer=None):
+        super().__init__(why)
+        self.answer = answer
+
+
+class Refused(Unusable):
+    """The model refused the request: stop_reason refusal (Anthropic's safeguards; stop_details has the category), or finish_reason
+    content_filter (the OpenAI format). structured() doesn't ask again, because the same request is refused again."""
+
+
+def structured(model, schema, parse=None):
+    """A typed answer from `model`, a LangChain chat model such as chat_model(): a runnable whose ainvoke(messages) gives a value of
+    `schema`. The schema is a Pydantic model class: the value is an instance, which Pydantic checks. Or it is a JSON schema dict with a
+    "title": the value is the dict of the call's arguments, with each key that the schema's top level requires. The model gets the
+    schema as its one tool, and the tool choice isn't forced. The newest Claude models refuse a forced one, and with_structured_output
+    forces one for a model alias such as the platform's. `parse`: your own step on the value. It returns the value to give, or raises
+    ValueError with why the value doesn't fit.
+
+    When the answer doesn't fit, the model is asked one time again, with the same messages and a short note of why. An answer doesn't
+    fit when it has no call of the tool, or a call that doesn't fit the schema or `parse`. It doesn't fit either when it has no text
+    and no tool call, or when it stopped at its output limit. After the second try, Unusable. A refusal raises Refused at once.
+
+    To keep it out of the AG-UI stream: quiet(structured(model, schema)). Not structured(quiet(model), ...): bind_tools on a wrapped
+    model drops the wrapper's settings."""
+    tool = convert_to_openai_tool(schema)["function"]
+    name, limit = tool["name"], getattr(model, "max_tokens", None)
+    llm = model.bind_tools([schema])   # no tool_choice: the model picks the tool
+
+    async def ask(messages, config=None):
+        messages, note = [HumanMessage(messages)] if isinstance(messages, str) else list(messages), []
+        for again in (False, True):
+            answer = await llm.ainvoke(messages + note, config)
+            try:
+                return _value(answer, schema, tool, limit, parse)
+            except Refused:
+                raise
+            except Unusable as e:
+                if again:
+                    raise
+                note = [HumanMessage(f"Your last answer could not be used: {e}. Call {name} once, with every field.")]
+    return RunnableLambda(ask, name=f"structured_{name}")
+
+
+def _value(answer, schema, tool, limit, parse):
+    """The value in the model's answer (an AIMessage) for structured(), or Unusable (Refused for a refusal) that says why there is
+    none. `limit`: the model's max_tokens, for the text of an answer that stopped there."""
+    name, meta = tool["name"], answer.response_metadata or {}
+    stop, key = convert._stop(meta)
+    if stop == convert._REFUSAL and key == "stop_reason":   # Anthropic's safeguards: stop_details has the category
+        category = (meta.get("stop_details") or {}).get("category") or "none given"
+        raise Refused(f"the model refused the call (Anthropic safeguards, category {category})", answer)
+    if stop == convert._REFUSAL:
+        raise Refused("the model refused the call (a content filter, finish_reason content_filter)", answer)
+    if stop == convert._LIMIT:
+        raise Unusable("the model's answer stopped at its output limit" + (f" ({limit} tokens)" if limit else ""), answer)
+    call = next((c for c in answer.tool_calls or [] if c.get("name") == name), None)
+    if call is None:
+        if any(c.get("name") == name for c in answer.invalid_tool_calls or []):
+            raise Unusable(f"the arguments of its {name} call are not JSON", answer)
+        content = answer.content
+        text = content if isinstance(content, str) else "".join(b.get("text") or "" for b in content if isinstance(b, dict))
+        if not answer.tool_calls and not text.strip():
+            raise Unusable("the model gave an empty answer, with no text and no tool call (a refusal through the LLM Gateway's OpenAI "
+                           "route looks like this)", answer)
+        raise Unusable(f"the model's answer has no {name} call", answer)
+    value = call.get("args") or {}
+    if isinstance(schema, type) and issubclass(schema, BaseModel):
+        try:
+            value = schema.model_validate(value)
+        except ValidationError as e:
+            why = "; ".join(f"{'.'.join(map(str, err['loc'])) or 'its arguments'}: {err['msg']}" for err in e.errors()[:3])
+            raise Unusable(f"its {name} call does not fit the schema: {why}", answer) from None
+    else:
+        missing = [k for k in tool.get("parameters", {}).get("required") or [] if k not in value]
+        if missing:
+            raise Unusable(f"its {name} call lacks {', '.join(missing)}", answer)
+    try:
+        return parse(value) if parse else value
+    except ValueError as e:
+        raise Unusable(str(e), answer) from None
+
+
 def agent(model=None, tools=()):
     """The ready-made graph's entry point: build_graph(checkpointer), which compiles the graph with the checkpointer that the platform's
     adapter gives (the thread lives in the state folder). The nodes: "agent" (one model call), "relay" (the open calls of gateway
@@ -181,15 +327,26 @@ def agent(model=None, tools=()):
     contract.check_names([t.name for t in langchain_tools])
     own = {t.name: t for t in langchain_tools}
 
-    async def call_model(state):
+    async def call_model(state, config):
         """One model call, with every tool the model can use: the relay's (without the client-side ones), the client-side ones, the own
-        tools and ask_human. An own tool with the name of a gateway tool or a client-side tool fails the run first (NameClash)."""
+        tools and ask_human. An own tool with the name of a gateway tool or a client-side tool fails the run first (NameClash).
+
+        After an answer with no text and no tool call, contract.EMPTY_ANSWER goes in the state as a user message, so route() calls the
+        model again: one time in an AG-UI run (_asked_again). When the last answer stopped at the output limit, it isn't a finished
+        answer: the run's last text, so the task's result, is contract.AT_LIMIT, a blank line, then the cut text."""
         names, relay = client_side(state), await relay_tools()
         contract.check_names(own, gateway=[t.name for t in relay], client=names)
         offered = ([t for t in relay if t.name not in names] + [convert.openai_tool(t) for t in state.get("tools") or []]
                    + list(own.values()) + [convert.openai_tool(contract.ASK_HUMAN_TOOL)])
         llm = (model or chat_model()).bind_tools(offered)
-        return {"messages": [await llm.ainvoke(system_prompt(state) + state["messages"])]}
+        answer = await llm.ainvoke(system_prompt(state) + state["messages"])
+        if answer.tool_calls:
+            return {"messages": [answer]}
+        if not (answer.text.strip() or _asked_again(state)):   # an empty answer: route() calls the model again
+            return {"messages": [answer, HumanMessage(contract.EMPTY_ANSWER)]}
+        if _at_limit(answer):   # not a finished answer: the run's last text says so first, then has the cut text
+            return {"messages": [answer, *(await finish(contract._cut_result(answer.text), config))["messages"]]}
+        return {"messages": [answer]}
 
     async def call_tools(state):
         """Each open call that runs here: an own tool's in this process, a gateway tool's through the relay. ainvoke with the call

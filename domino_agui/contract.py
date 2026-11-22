@@ -13,6 +13,16 @@ audit them:
     specs, own = contract.own_tools(tools)                               # when the entry point is built: NameClash for ask_human
     contract.check_names(own, gateway=relay_names, client=client_names)  # in each AG-UI run, before the model call
     result = await contract.call_tool(call.name, call.arguments, own)    # an own tool here, a gateway tool through the relay
+
+The agent's own code (a node of its own graph, a step of its own flow) reads the task's facts, and calls a gateway tool, with no parse
+of a text that is written for a model:
+
+    facts = contract.task(run.context)                                   # a dict, or None outside a Job (no facts item)
+    bundle = await contract.call_json("get_bundle", {"bundleId": bundle_id})   # the answer's JSON; ToolError for a denial
+    result = await contract.gateway_call("get_bundle", {"bundleId": bundle_id})   # the ToolResult, with is_error for a denial
+    data = result.json()                                                 # the JSON at the start of the answer (a note can follow)
+
+Outside a Job (no AGENT_SERVICE_URL) there is no relay: gateway_call() and call_json() raise a RelayError that names the setting.
 """
 import asyncio
 import inspect
@@ -21,7 +31,7 @@ import os
 import types
 import typing
 
-from .relay import Relay, ToolResult
+from .relay import Relay, RelayError, ToolResult
 
 ASK_HUMAN = "ask_human"
 # ask_human, the agent's tool for a question to a person, as an AG-UI tool (name, description, parameters). The agent ends its AG-UI run
@@ -36,6 +46,14 @@ NO_ANSWER = "No answer came before the question expired, so it was cancelled."
 # ask_human's result for a question that the agent doesn't ask: a second one in the same answer, or one next to a client-side call. An
 # AG-UI run ends with one interrupt at most, and the ready-made handler and flow keep one open question across runs
 ONE_QUESTION = "Ask one question at a time: ask this again once you have the answer you are waiting for."
+# The message that the ready-made LangGraph agent and the loop give the model after an answer with no text and no tool call, one time
+# in an AG-UI run, as a user message. A second empty answer ends the AG-UI run. (CrewAI's flow doesn't send it.)
+EMPTY_ANSWER = "Your last answer was empty. Continue with the task, or give your result."
+# The note at the start of the run's result when the model's last answer stopped at the output limit (MAX_TOKENS, or the limit of the
+# author's own model). The answer isn't finished, so the result says so first, and says how to give the model more room. A blank line
+# and the cut text come after it (_cut_result). The ready-made LangGraph agent and the loop send it
+AT_LIMIT = ("The model's last answer stopped at its output limit, so it is not a finished answer. To give the model a larger limit, "
+            "set AGENT_MAX_TOKENS, or max_tokens on the agent's own model.")
 # The relay client's timeouts, in seconds: to connect, then for each answer. A relay call can stay open for up to 45 s, so the time
 # for an answer must be at least 60 s
 CONNECT_TIMEOUT, READ_TIMEOUT = 30, 300
@@ -43,6 +61,37 @@ CONNECT_TIMEOUT, READ_TIMEOUT = 30, 300
 # The framework of the Environment this runs in: each framework image sets it (an ENV line in its Dockerfile), and the sandbox keeps
 # AGENT_* variables for the agent server. Not set on a laptop
 FRAMEWORK_ENV = "AGENT_FRAMEWORK"
+# The variable that sets MAX_TOKENS, in tokens (an AGENT_* variable, so the sandbox keeps it for the agent server)
+MAX_TOKENS_ENV = "AGENT_MAX_TOKENS"
+
+
+def _max_tokens():
+    """MAX_TOKENS_ENV as a whole number above 0, or 16000 when it isn't set. Another value is a ValueError, at the import."""
+    value = os.environ.get(MAX_TOKENS_ENV, "").strip()
+    if not value:
+        return 16000
+    if not (value.isascii() and value.isdigit()) or int(value) < 1:
+        raise ValueError(f"{MAX_TOKENS_ENV} is the model's output limit, a whole number of tokens above 0, and it is {value!r}")
+    return int(value)
+
+
+# The output limit of the platform's model, in tokens. Each ready-made agent gives it to each model call: the loop's call_model(), the
+# LangGraph module's chat_model() and the CrewAI flow's litellm_arguments(). The author's own model or option can set another limit.
+# With no limit, an alias with no model profile gets 4,096 tokens, and that cuts a long answer
+MAX_TOKENS = _max_tokens()
+
+
+def _cut_result(text):
+    """The run's last text when the model's last answer stopped at the output limit: AT_LIMIT, a blank line, then the cut text. So
+    the task's result says first that the answer isn't finished, and keeps the partial answer. AT_LIMIT alone when there is no text."""
+    return f"{AT_LIMIT}\n\n{text}" if text.strip() else AT_LIMIT
+
+
+def _output_limit(options, key="max_tokens"):
+    """The output limit to add to a model call: {key: MAX_TOKENS}, or {} when its `options` set one (max_tokens or
+    max_completion_tokens). The loop's call_model() and the CrewAI flow's litellm_arguments() use it."""
+    return {} if {"max_tokens", "max_completion_tokens"} & set(options) else {key: MAX_TOKENS}
+
 
 _relay = None    # the relay client for this agent server
 _listed = None   # the relay's tools, listed once for each agent server, at the first run (no network at import)
@@ -80,7 +129,8 @@ def alias_format():
 
 def relay():
     """The relay client for this agent server (MCP at $AGENT_SERVICE_URL/mcp, with $SESSION_TOKEN): connect timeout CONNECT_TIMEOUT,
-    read timeout READ_TIMEOUT, never through the egress proxy. None outside a Job (no AGENT_SERVICE_URL)."""
+    read timeout READ_TIMEOUT, never through the egress proxy. None outside a Job (no AGENT_SERVICE_URL): there, gateway_call() and
+    call_json() raise a RelayError that says so."""
     global _relay
     if not os.environ.get("AGENT_SERVICE_URL"):
         return None
@@ -110,6 +160,41 @@ async def call_tool(name, arguments, own=None):
     if name in {t["name"] for t in await relay_tools()}:
         return await relay().call(name, arguments)
     return ToolResult(no_tool(name), True)
+
+
+async def gateway_call(name, arguments):
+    """A gateway tool call from the agent's own code (a node of its own graph, a step of its own flow), through the Job's relay.
+    `arguments`: a dict, or its JSON text. -> the relay's ToolResult: a denial or a failed call is a result with is_error, as for the
+    model. Outside a Job (no AGENT_SERVICE_URL: a laptop, a unit test) there is no relay, so it raises RelayError, which names the
+    setting."""
+    client = relay()
+    if client is None:
+        raise RelayError("AGENT_SERVICE_URL isn't set, so there is no relay for the gateway tools: the platform sets it in the Job of a "
+                         "framework agent. Elsewhere (a laptop, a unit test), give your code a stand-in for the call, or call a relay "
+                         "that you run with Relay(url=..., token=...)")
+    return await client.call(name, arguments)
+
+
+class ToolError(RuntimeError):
+    """A gateway tool answered with an error (a denial, or a call that failed): call_json() raises it. `name` is the tool, and `result`
+    its ToolResult (result.text: the gateway's text, which says why)."""
+
+    def __init__(self, name, result):
+        super().__init__(f"the gateway tool {name} answered with an error: {result.text}")
+        self.name, self.result = name, result
+
+
+async def call_json(name, arguments):
+    """A gateway tool call from the agent's own code that gives the JSON of the answer (ToolResult.json(): a note after the JSON is
+    left out). `arguments`: a dict, or its JSON text. A denial or a failed call raises ToolError, an answer that isn't JSON a
+    ValueError that names the tool, and a call outside a Job a RelayError (as gateway_call())."""
+    result = await gateway_call(name, arguments)
+    if result.is_error:
+        raise ToolError(name, result)
+    try:
+        return result.json()
+    except ValueError as e:
+        raise ValueError(f"{name}: {e}") from None
 
 
 def own_tools(tools):
@@ -236,8 +321,59 @@ def _schema(hint):
     return out
 
 
+# The description of the AG-UI context item with the task's facts. The agent service sends it in each AG-UI run of a framework agent,
+# after the text item (the operating rules and the task brief): its value is the facts as compact JSON
+FACTS = "Domino Agents: the task's facts (JSON)"
+# The version of the facts that task() reads. A new field is an addition to this version; a rename or a removal is a new version
+FACTS_VERSION = 1
+
+
 def system_prompt(context):
     """The model's system prompt: the `value` of each AG-UI context entry (the agent's system prompt, the platform's operating rules
-    and the task brief), in order, as one text. "" when there is none."""
-    values = (str(c.get("value") or "").strip() for c in context or [] if isinstance(c, dict))
+    and the task brief), in order, as one text. "" when there is none. An entry is a dict, or an object with the two attributes
+    (AG-UI's Context), as for task(). The task's facts (the entry FACTS) are left out: they are for the agent's code (task()), and the
+    task brief gives the model the same facts as text."""
+    values = (str(value or "").strip() for description, value in (_entry(c) for c in context or []) if description != FACTS)
     return "\n\n".join(v for v in values if v)
+
+
+def task(context):
+    """The task's facts, from the AG-UI run's context (run.context; in LangGraph state["ag-ui"]["context"], in CrewAI state.context),
+    as a dict, so that the agent's code reads a fact with no parse of the task brief. None when the context has no facts item (FACTS):
+    outside a Job, or with an agent service that doesn't send it. Facts of another version than FACTS_VERSION, or an item that isn't a
+    JSON object, raise a ValueError. The keys of version 1:
+
+    version         1 (FACTS_VERSION)
+    task            {id, key, title}
+    project         {id, name, owner}: the task's project (owner: its owner's user name, or None), or None
+    resources       the task's resources, except its project, in the task's order: {type, id, name, access, mount, from}. `access`
+                    is "read" or "write", `mount` the path in the Job (a dataset or a volume; else None), `from` why the task has it:
+                    "pinned" (the trigger's resources), "context" (the trigger's payload names it), "approval" (a person granted it) or
+                    "caller" (the call that started the task, or a message on it)
+    inputs          {name: value} for each named input of the agent: a resource {type, id, name} (a list for an input that takes
+                    more than one), a text input's text, or None
+    trigger         {id, type, name} of the subscription (type "event") or the schedule (type "schedule"), or None for a direct run
+    payload         what the task got with it: an event's payload, a schedule's {"schedule": {...}}, or a direct call's context. None
+                    when there is none, or when it was too large (then payloadOmitted is True)
+    payloadOmitted  True when the payload was left out for its size. Its entities are still in `resources` (from "context")
+    """
+    value = next((v for d, v in (_entry(c) for c in context or []) if d == FACTS), None)
+    if value is None:
+        return None
+    try:
+        facts = json.loads(value) if isinstance(value, str) else value
+    except ValueError as e:
+        raise ValueError(f"the task's facts (the AG-UI context item {FACTS!r}) are not JSON: {e}") from None
+    if not isinstance(facts, dict):
+        raise ValueError(f"the task's facts (the AG-UI context item {FACTS!r}) are not a JSON object: {str(value)[:200]}")
+    if facts.get("version") != FACTS_VERSION:
+        raise ValueError(f"the task's facts have version {facts.get('version')!r}, and this domino-agui reads version {FACTS_VERSION}: "
+                         "use a domino-agui that reads that version")
+    return facts
+
+
+def _entry(c):
+    """An AG-UI context entry as (description, value): a dict, or an object with the two attributes (AG-UI's Context)."""
+    if isinstance(c, dict):
+        return c.get("description"), c.get("value")
+    return getattr(c, "description", None), getattr(c, "value", None)

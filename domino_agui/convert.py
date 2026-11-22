@@ -11,6 +11,21 @@ from dataclasses import dataclass
 
 from .run import _id
 
+# Why a model's answer isn't finished, by its stop reason: Anthropic's stop_reason, or OpenAI's finish_reason. LangChain keeps both in
+# response_metadata. _LIMIT: the answer stopped at the output limit. _REFUSAL: the model refused (Anthropic's safeguards, or a filter)
+_LIMIT, _REFUSAL = "limit", "refusal"
+_STOPS = {"stop_reason": {"max_tokens": _LIMIT, "refusal": _REFUSAL}, "finish_reason": {"length": _LIMIT, "content_filter": _REFUSAL}}
+
+
+def _stop(meta):
+    """Why an answer isn't finished, from the dict that holds its stop reason (an Anthropic message, an OpenAI choice, or LangChain's
+    response_metadata). -> (_LIMIT or _REFUSAL, the key that says so), or (None, None) for a finished answer."""
+    for key, why in _STOPS.items():
+        reason = (meta or {}).get(key)
+        if isinstance(reason, str) and reason in why:
+            return why[reason], key
+    return None, None
+
 
 @dataclass(frozen=True)
 class ToolCall:
@@ -23,9 +38,12 @@ class ToolCall:
 
 @dataclass(frozen=True)
 class Answer:
-    """The model's answer as library outputs: `text` ("" when none) for run.text(), and `tool_calls`."""
+    """The model's answer as library outputs: `text` ("" when none) for run.text(), and `tool_calls`. `at_limit` is True when the
+    answer stopped at the output limit (Anthropic's stop_reason max_tokens, OpenAI's finish_reason length): then it isn't a finished
+    answer, and its text or its last tool call can be cut."""
     text: str
     tool_calls: tuple = ()
+    at_limit: bool = False
 
     def message(self):
         """The answer as an AG-UI assistant message, for the agent's own copy of the history within one AG-UI run."""
@@ -72,10 +90,12 @@ def openai_tool(tool):
 
 
 def from_openai(completion):
-    """An OpenAI chat completion (a dict, or the SDK's object) as an `Answer`: the first choice's text and tool calls."""
-    msg = _plain(completion)["choices"][0]["message"]
+    """An OpenAI chat completion (a dict, or the SDK's object) as an `Answer`: the first choice's text and tool calls, and whether it
+    stopped at the output limit (finish_reason length)."""
+    choice = _plain(completion)["choices"][0]
+    msg = choice["message"]
     return Answer(msg.get("content") or "", tuple(ToolCall(c["id"], c["function"]["name"], c["function"]["arguments"])
-                                                  for c in msg.get("tool_calls") or []))
+                                                  for c in msg.get("tool_calls") or []), _stop(choice)[0] == _LIMIT)
 
 
 def to_anthropic(messages, tools=None):
@@ -116,10 +136,12 @@ def to_anthropic(messages, tools=None):
 
 def from_anthropic(message):
     """An Anthropic Messages answer (a dict, or the SDK's object) as an `Answer`: its text blocks and its tool_use blocks, with each
-    input as JSON text. Thinking blocks are left out."""
-    blocks = _plain(message)["content"]
+    input as JSON text, and whether it stopped at the output limit (stop_reason max_tokens). Thinking blocks are left out."""
+    message = _plain(message)
+    blocks = message["content"]
     return Answer("".join(b["text"] for b in blocks if b["type"] == "text"),
-                  tuple(ToolCall(b["id"], b["name"], json.dumps(b["input"])) for b in blocks if b["type"] == "tool_use"))
+                  tuple(ToolCall(b["id"], b["name"], json.dumps(b["input"])) for b in blocks if b["type"] == "tool_use"),
+                  _stop(message)[0] == _LIMIT)
 
 
 def _plain(answer):

@@ -45,7 +45,8 @@ certified Environment of the framework.
 
 Each ready-made agent does the same things:
 
-- It calls the model in `AGENT_MODEL`, in the format of `AGENT_MODEL_FORMAT`, through the Job's model proxy.
+- It calls the model in `AGENT_MODEL`, in the format of `AGENT_MODEL_FORMAT`, through the Job's model proxy. Each model call has an
+  output limit of 16,000 tokens (`contract.MAX_TOKENS`), or the value of `AGENT_MAX_TOKENS`.
 - It offers the model the agent-side tools that the relay lists, and runs them in the same AG-UI run. A denial comes back as the
   tool's answer, and the model reads it.
 - It offers the client-side tools of the run, and doesn't run them. A call to one ends the AG-UI run. The agent service runs the
@@ -53,8 +54,16 @@ Each ready-made agent does the same things:
 - It offers `ask_human`, the agent's tool for a question to a person. The AG-UI run ends with one interrupt, and the reply is the
   tool's result.
 - It uses the run's context (the agent's system prompt, the platform's operating rules and the task brief) as the model's system
-  prompt.
+  prompt. The task's facts aren't in it: they are for your code.
 - It loops until the model's answer has no tool call. That last text is the task's result.
+- An empty answer (no text and no tool call) doesn't end the AG-UI run at once. The LangGraph graph and the loop give the model one
+  more message, `contract.EMPTY_ANSWER`: "Your last answer was empty. Continue with the task, or give your result." They do this one
+  time in an AG-UI run. A run that resumes after a reply is a new AG-UI run, so it can get its own retry. When the next answer is
+  empty too, the AG-UI run ends with no result. The CrewAI flow runs its own model loop, so it has the output limit, but not this
+  retry.
+- An answer that stopped at the output limit isn't a finished answer. When the last answer of the LangGraph graph or the loop stopped
+  at the limit, the run's last text, and so the task's result, starts with `contract.AT_LIMIT`. That note says that the answer isn't
+  finished, and how to give the model a larger limit. A blank line and the cut text come after it.
 
 ## The two options: `model=` and `tools=`
 
@@ -96,6 +105,90 @@ takes LangChain tools.
 The model still goes through the Job's model proxy: the base URL and the key come from the environment. Give `ChatOpenAI`
 `use_responses_api=False`, so that it uses chat completions. To limit the length of an answer, use `max_tokens`. Don't set a
 temperature: a gpt-5 model can refuse a temperature other than 1.
+
+**The output limit.** With no `model=`, each model call has the limit `contract.MAX_TOKENS`: 16,000 tokens, or the value of
+`AGENT_MAX_TOKENS` (a whole number above 0, read when the library is imported). To change the limit of the platform's model in
+LangGraph, use `chat_model(max_tokens=...)`:
+
+```python
+from domino_agui.langgraph import agent, chat_model
+
+build_graph = agent(model=chat_model(max_tokens=32000))
+```
+
+For the loop, `Model(max_tokens=32000)` keeps the platform's model and changes its limit. The CrewAI flow and the loop give the limit
+to an own model that sets none. A LangChain chat model of your own keeps its own limit: give it `max_tokens`, because a model alias
+with no model profile can get a small default (4,096 tokens), which cuts a long answer.
+
+## Your own LangGraph graph
+
+An agent with its own steps builds its own graph from the helpers in `domino_agui.langgraph`: `State`, `system_prompt()`,
+`chat_model()`, `relay_tools()`, and the helpers below. The entry point has the same shape, `build_graph(checkpointer)`.
+
+- **`await finish(text)`** gives the task's result from your own last node, for example a node of plain code with no model call. It
+  streams `text` as the run's last text message, and returns the state's update with the same message: the stream and the state
+  have one message ID. The task's result is that text. On Python 3.10, give the node's config too: `finish(text, config)`.
+- **`quiet(runnable)`** keeps the model calls of a runnable (a chat model, or `structured()`) out of the AG-UI stream: no text and
+  no tool call of them is streamed. Use it for a model call whose answer your own code reads. Else the stream shows a tool call that
+  no tool runs. A tool that the runnable runs with a tool call is still streamed.
+- **`structured(model, schema, parse=None)`** gives a typed answer: `await structured(model, schema).ainvoke(messages)`. The schema
+  is a Pydantic model class (you get an instance, which Pydantic checks), or a JSON schema dict with a `title` (you get the dict,
+  with each key that the schema's top level requires). The model gets the schema as its one tool, and the tool choice isn't forced:
+  the newest Claude models refuse a forced tool choice, and LangChain's `with_structured_output` forces one for a model alias.
+  - When the answer doesn't fit, the model is asked one time again, with the same messages and a short note of why. An answer
+    doesn't fit when it has no call of the tool, the call doesn't fit the schema, it has no text and no tool call, or it stopped at
+    the output limit. Then `structured()` raises `Unusable`, and `str()` of it says why.
+  - A refusal (`stop_reason` refusal, or `finish_reason` content_filter) raises `Refused` (an `Unusable`) at once, with no more
+    try: the same request is refused again.
+  - `parse` is your own step on the value: it returns the value to give, or raises `ValueError` with why it doesn't fit. The model
+    is then asked again too.
+  - To keep it out of the stream, put `quiet()` outside: `quiet(structured(model, schema))`.
+
+A graph with two nodes: the model's verdict, which the graph reads itself, then the task's result from plain code.
+
+```python
+from typing import Literal
+
+from langchain_core.messages import HumanMessage
+from langgraph.graph import END, START, StateGraph
+from pydantic import BaseModel
+
+from domino_agui.langgraph import State, Unusable, chat_model, finish, quiet, structured, system_prompt
+
+
+class Verdict(BaseModel):
+    """The verdict on the change: approve or reject, and why."""
+    verdict: Literal["approve", "reject"]
+    reason: str
+
+
+class Review(State, total=False):
+    verdict: dict
+
+
+async def judge(state: Review):
+    ask = quiet(structured(chat_model(), Verdict))
+    try:
+        got = await ask.ainvoke(system_prompt(state) + state["messages"] + [HumanMessage("Give your verdict.")])
+    except Unusable as e:   # also a refusal (Refused)
+        return {"verdict": {"verdict": "could not check", "reason": str(e)}}
+    return {"verdict": got.model_dump()}
+
+
+async def report(state: Review):
+    v = state["verdict"]
+    return await finish(f"Verdict: {v['verdict']}. {v['reason']}")
+
+
+def build_graph(checkpointer):
+    g = StateGraph(Review)
+    g.add_node("judge", judge)
+    g.add_node("report", report)
+    g.add_edge(START, "judge")
+    g.add_edge("judge", "report")
+    g.add_edge("report", END)
+    return g.compile(checkpointer=checkpointer)
+```
 
 ## A hand-written handler on the core
 
@@ -150,6 +243,48 @@ curl -sN --unix-socket agent.sock http://agent/agent -H 'Content-Type: applicati
 
 The answer is the run's AG-UI events, one per `data:` line.
 
+## The task's facts and gateway calls from your code
+
+Your own graph, flow or handler can read the task's facts, and call a gateway tool from its code, with no parse of the task brief.
+The agent service sends the facts in each AG-UI run, as JSON in a second context item. `contract.task(context)` gives them as a
+dict:
+
+```python
+from domino_agui import contract
+
+facts = contract.task(run.context)   # LangGraph: state["ag-ui"]["context"]; CrewAI: state.context
+bundle = next(r for r in facts["resources"] if r["type"] == "bundle")
+docs = next(r for r in facts["resources"] if r["from"] == "pinned")   # a resource of the trigger, with its mount
+```
+
+- The facts have `version` 1, `task` (`id`, `key`, `title`), `project` (`id`, `name`, `owner`), `resources` (each with `type`,
+  `id`, `name`, `access`, `mount` and `from`), `inputs`, `trigger` (`id`, `type`, `name`; None for a direct run), `payload` (the
+  trigger's payload) and `payloadOmitted` (True when the payload was too large to send). The docstring of `contract.task()` says what
+  each one holds.
+- A new field is an addition to version 1. Facts of another version raise a `ValueError` that names the version.
+- Outside a Job, or with an agent service that doesn't send them, there are no facts: `task()` gives None.
+- `contract.system_prompt()` leaves the facts out. The task brief gives the model the same facts as text.
+
+To call a gateway tool from your code, use `contract.call_json()` for the JSON of its answer, or `contract.gateway_call()` for its
+`ToolResult`:
+
+```python
+found = await contract.call_json("get_bundle", {"bundleId": bundle["id"]})   # a dict
+
+result = await contract.gateway_call("get_bundle", {"bundleId": bundle["id"]})
+if not result.is_error:   # is_error: a denial, or a call that failed
+    found = result.json()
+```
+
+- Each call goes through the gateway's decision and audit, as the model's calls do.
+- `ToolResult.json()` gives the JSON at the start of the answer. A note for the model can follow the JSON on the next lines
+  (`run_job` adds one): `json()` leaves it out. An answer that isn't JSON raises a `ValueError`. A denial is JSON too, so look at
+  `is_error` first.
+- `call_json()` raises `contract.ToolError` for a denial or a failed call. Its text has the gateway's text, `e.name` is the tool and
+  `e.result` is the `ToolResult`.
+- Outside a Job (no `AGENT_SERVICE_URL`), there is no relay: `gateway_call()` and `call_json()` raise a `RelayError` that names
+  `AGENT_SERVICE_URL`. In a unit test, give your code a stand-in for the call.
+
 ## The agent contract
 
 The platform sets these variables in the agent server's environment, in a Job:
@@ -161,6 +296,10 @@ The platform sets these variables in the agent server's environment, in a Job:
 | `AGENT_SERVICE_URL` | The agent service. Its relay is MCP at `$AGENT_SERVICE_URL/mcp`: the agent-side tools. Not set outside a Job, so there are no agent-side tools on a laptop. |
 | `SESSION_TOKEN` | The relay's bearer token for this Job. |
 | `AGENT_FRAMEWORK` | The framework of the Environment. A framework module of another framework fails at its import, with an error that names the Environment to use. Not set on a laptop. |
+
+You can set one more variable in the Job's environment, for example as a project's environment variable: `AGENT_MAX_TOKENS`, the
+output limit of the ready-made agents' model calls, in tokens (`contract.MAX_TOKENS`, 16,000 when it isn't set). The sandbox keeps
+`AGENT_*` variables for the agent server. A value that isn't a whole number above 0 fails at the import, with an error that names it.
 
 The platform also sets each model SDK's base URL and key, so that each model call goes through the Job's model proxy and the model
 gateway. On a laptop, set `AGENT_MODEL`, `AGENT_MODEL_FORMAT` and your provider's key.

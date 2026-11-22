@@ -456,12 +456,14 @@ code = ("import sys, asyncio; sys.path.insert(0, sys.argv[1]); import domino_agu
         "asyncio.run(c.call_function(c.system_prompt, {'context': []})); c.own_tools([c.system_prompt]); c.ask_human_arguments('{}'); "
         "c.alias_format(); assert c.relay() is None and asyncio.run(c.call_tool('x', {})).is_error; "
         "domino_agui.convert.openai_tool(c.ASK_HUMAN_TOOL); "
+        "assert c.task([{'description': c.FACTS, 'value': '{\"version\": 1}'}]) == {'version': 1} and domino_agui.ToolResult('{}').json() == {}; "
         "print(domino_agui.__version__); print(sorted(m for m in sys.modules if m.startswith('domino_agui.')))")
 p = subprocess.run([sys.executable, "-I", "-S", "-c", code, LIB,
                                   os.path.join(tempfile.mkdtemp(prefix="agui", dir="/tmp"), "s.sock")], capture_output=True, text=True)
 out = p.stdout.split("\n")
 check("domino_agui imports, starts its server, converts, makes a relay client and uses the contract's parts (the schema builder, the "
-      "name check, an own tool's call and a tool call with no relay too) with the standard library only (python -I -S)", p.returncode == 0 and out[0] == domino_agui.__version__, p.stderr[-500:])
+      "name check, an own tool's call, a tool call with no relay, the task's facts and a tool answer's JSON too) with the standard library "
+      "only (python -I -S)", p.returncode == 0 and out[0] == domino_agui.__version__, p.stderr[-500:])
 check("import domino_agui imports no framework module (domino_agui.langgraph, .crewai, .loop)",
       p.returncode == 0 and not {"domino_agui.langgraph", "domino_agui.crewai", "domino_agui.loop"} & set(json.loads(out[1].replace("'", '"'))),
       out[1:2])
@@ -633,6 +635,60 @@ check("from_anthropic: the text blocks as the text, each tool_use as a tool call
 answer = convert.from_anthropic(SDKObject(anthropic_message("Done")))
 check("from_anthropic reads the SDK's answer object too; a text answer has no tool calls", answer.text == "Done" and answer.tool_calls == (), answer)
 
+# --- the output limit: contract.MAX_TOKENS is the platform's model's default output limit, 16,000 tokens, or AGENT_MAX_TOKENS. The
+#     contract reads the variable at its import, so each case imports it in a new Python, with the standard library only
+from domino_agui import contract  # noqa: E402
+
+LIMIT = """import sys
+sys.path.insert(0, sys.argv[1])
+try:
+    from domino_agui import contract
+    print(contract.MAX_TOKENS_ENV, contract.MAX_TOKENS)
+except Exception as e:
+    print(type(e).__name__ + ": " + str(e))
+"""
+
+
+def limit_with(value):
+    """What the contract's import gives with AGENT_MAX_TOKENS set to `value` (None: not set): its name and MAX_TOKENS, or the error."""
+    env = {k: v for k, v in os.environ.items() if k != "AGENT_MAX_TOKENS"}
+    p = subprocess.run([sys.executable, "-I", "-S", "-c", LIMIT, LIB], capture_output=True, text=True,
+                       env={**env, **({"AGENT_MAX_TOKENS": value} if value is not None else {})})
+    return (p.stdout + p.stderr).strip()
+
+
+check("contract.MAX_TOKENS: 16000 when AGENT_MAX_TOKENS isn't set or is empty (contract.MAX_TOKENS_ENV names the variable)",
+      limit_with(None) == "AGENT_MAX_TOKENS 16000" and limit_with("") == "AGENT_MAX_TOKENS 16000", (limit_with(None), limit_with("")))
+check("...AGENT_MAX_TOKENS sets it, in tokens", limit_with("32000") == "AGENT_MAX_TOKENS 32000" and limit_with(" 2048 ") == "AGENT_MAX_TOKENS 2048",
+      (limit_with("32000"), limit_with(" 2048 ")))
+bad = [limit_with(v) for v in ("lots", "0", "-5", "1.5")]
+check("...a value that isn't a whole number above 0 fails at the import, with a ValueError that names the variable and the value",
+      all(b.startswith("ValueError: AGENT_MAX_TOKENS ") for b in bad) and "'lots'" in bad[0] and "'0'" in bad[1], bad)
+
+# --- an answer that stopped at the output limit: Anthropic's stop_reason max_tokens, OpenAI's finish_reason length. The other stop
+#     reasons are a finished answer
+cut = lambda answer, **stop: {**answer, **stop} if "stop_reason" in stop else {**answer, "choices": [{**answer["choices"][0], **stop}]}
+got = [convert.from_anthropic(cut(anthropic_message("The report is cu"), stop_reason="max_tokens")).at_limit,
+       convert.from_anthropic(SDKObject(cut(anthropic_message(""), stop_reason="max_tokens"))).at_limit,
+       convert.from_anthropic(anthropic_message("Done")).at_limit,
+       convert.from_anthropic(anthropic_message("", ("toolu_01", "ping", {}))).at_limit]
+check("from_anthropic: answer.at_limit is True for stop_reason max_tokens (the SDK's object too), False for end_turn and tool_use",
+      got == [True, True, False, False], got)
+got = [convert.from_openai(cut(openai_completion("The report is cu"), finish_reason="length")).at_limit,
+       convert.from_openai(SDKObject(cut(openai_completion(None), finish_reason="length"))).at_limit,
+       convert.from_openai(openai_completion("Done")).at_limit,
+       convert.from_openai(openai_completion(None, ("call_9", "ping", "{}"))).at_limit]
+check("from_openai: answer.at_limit is True for finish_reason length (the SDK's object too), False for stop and tool_calls",
+      got == [True, True, False, False], got)
+check("convert.Answer(text) is a finished answer unless it says so: at_limit is False", convert.Answer("Done").at_limit is False)
+check("contract.EMPTY_ANSWER is the message that the ready-made LangGraph agent and the loop give the model, one time in an AG-UI run, "
+      "after an answer with no text and no tool call", contract.EMPTY_ANSWER == "Your last answer was empty. Continue with the task, or "
+      "give your result.", contract.EMPTY_ANSWER)
+check("contract.AT_LIMIT starts the AG-UI run's result when the model's last answer stopped at the output limit: it says that the "
+      "answer is not finished, and how to give the model more room",
+      contract.AT_LIMIT == "The model's last answer stopped at its output limit, so it is not a finished answer. To give the model a "
+      "larger limit, set AGENT_MAX_TOKENS, or max_tokens on the agent's own model.", contract.AT_LIMIT)
+
 # --- the agent contract's shared parts: each ready-made agent, and an author's own graph, flow or loop, uses them the same way on
 #     every framework. The expected values are written out: a model reads these texts, so a change to one is a change to the contract
 from domino_agui import contract  # noqa: E402
@@ -655,6 +711,59 @@ check("contract.system_prompt(context): the AG-UI context's values, in order, as
       contract.system_prompt(context) == "You triage alerts.\n\nRules: 1. Ask first.\n\nAlert 7.", repr(contract.system_prompt(context)))
 check("contract.system_prompt: no context (a laptop run) gives no text", contract.system_prompt([]) == "" and contract.system_prompt(None) == "",
       (contract.system_prompt([]), contract.system_prompt(None)))
+
+# --- the task's facts: the agent service sends them as JSON in a second AG-UI context item, after the text item, and contract.task()
+#     gives them to the agent's code. The facts here have the shape and the encoding that the agent service sends: version 1, compact
+#     JSON with no ASCII escapes
+FACTS = {"version": 1, "task": {"id": "task_0123", "key": "AGT-42", "title": "Scan the bundle"},
+         "project": {"id": "p-1", "name": "local-proj", "owner": "the-owner"},
+         "resources": [{"type": "dataset", "id": "ds-1", "name": "docs", "access": "read", "mount": "/mnt/data/docs", "from": "pinned"},
+                       {"type": "bundle", "id": "b-1", "name": "Zürich bundle", "access": "read", "mount": None, "from": "context"}],
+         "inputs": {"docs": {"type": "dataset", "id": "ds-1", "name": "docs"}},
+         "trigger": {"id": "tr-1", "type": "event", "name": "On a bundle"},
+         "payload": {"bundle": {"id": "b-1", "name": "Zürich bundle"}, "stage": "Approval"}, "payloadOmitted": False}
+facts_item = {"description": "Domino Agents: the task's facts (JSON)", "value": json.dumps(FACTS, separators=(",", ":"), ensure_ascii=False)}
+brief = {"description": "Domino Agents: the operating rules and the task brief", "value": "Rules: 1. Ask first.\n\nThe task: scan b-1."}
+check("contract.task(context): the task's facts, from the context item \"Domino Agents: the task's facts (JSON)\", as a dict",
+      contract.task([brief, facts_item]) == FACTS, contract.task([brief, facts_item]))
+
+
+class Context:
+    """AG-UI's Context, as a framework's bridge can give it: an object with `description` and `value`, not a dict."""
+    def __init__(self, description, value):
+        self.description, self.value = description, value
+
+
+check("contract.task: an item that is an object with `description` and `value` (AG-UI's Context) is read too",
+      contract.task([Context(**brief), Context(**facts_item)]) == FACTS)
+check("contract.task: None when the context has no facts item (an older agent service), or no context (outside a Job)",
+      contract.task([brief]) is None and contract.task([]) is None and contract.task(None) is None,
+      (contract.task([brief]), contract.task([]), contract.task(None)))
+
+
+def facts_error(value):
+    """'ValueError: <text>' when contract.task() raises one for a facts item with this value, else what happened instead."""
+    try:
+        return f"no error: {contract.task([brief, {**facts_item, 'value': value}])!r}"
+    except ValueError as e:
+        return f"ValueError: {e}"
+    except Exception as e:
+        return f"not a ValueError: {type(e).__name__}: {e}"
+
+
+why = [facts_error(json.dumps({**FACTS, "version": 2})), facts_error(json.dumps({k: v for k, v in FACTS.items() if k != "version"}))]
+check("contract.task: facts of another version raise a ValueError that names that version and the version this library reads (1)",
+      why[0].startswith("ValueError: ") and "version 2" in why[0] and "version 1" in why[0]
+      and why[1].startswith("ValueError: ") and "version None" in why[1], why)
+why = [facts_error('{"version": 1, "task": '), facts_error("[1]")]
+check("contract.task: a facts item that isn't a JSON object raises a ValueError that names the item",
+      all(w.startswith("ValueError: ") and "the task's facts" in w for w in why), why)
+check("contract.system_prompt leaves the facts item out: the facts are for the agent's code, and the text item is for the model",
+      contract.system_prompt([brief, facts_item]) == "Rules: 1. Ask first.\n\nThe task: scan b-1."
+      and contract.system_prompt([facts_item]) == "", (contract.system_prompt([brief, facts_item]), contract.system_prompt([facts_item])))
+got = contract.system_prompt([Context(**brief), Context(**facts_item)])
+check("contract.system_prompt reads an object entry (AG-UI's Context) too, as task() does, and leaves its facts item out",
+      got == "Rules: 1. Ask first.\n\nThe task: scan b-1.", repr(got))
 got = [contract.ask_human_arguments(a) for a in ('{"question": "Close A-1?", "expires_at": "2026-11-11T09:00:00Z"}', {"question": "Why?"},
                                                    "Close it?", None)]
 check("contract.ask_human_arguments: the model's ask_human arguments (a dict, or its JSON text) as (question, expires_at); text that "
@@ -874,6 +983,8 @@ def fake_mcp(wait=0.0):
             elif name == "get_dataset":
                 result = {"content": [{"type": "text", "text": json.dumps({"id": body["params"]["arguments"]["datasetId"]})},
                                       {"type": "image", "data": "aGk=", "mimeType": "image/png"}, {"type": "text", "text": "1 row"}]}
+            elif name == "count_rows":   # a tool whose answer is a plain text, not JSON
+                result = {"content": [{"type": "text", "text": "3 rows"}]}
             elif name == "write_dataset_description":
                 result = {"content": [{"type": "text", "text": f"{name} was denied: the dataset is read-only"}], "isError": True}
             else:
@@ -937,9 +1048,63 @@ res = asyncio.run(relay.call("get_dataset", '{"datasetId": "ds2"}'))
 check("relay.call() takes the model's arguments as JSON text too (ToolCall.arguments), and sends them as a JSON object",
       res == domino_agui.ToolResult('{"id": "ds2"}\n1 row') and received[-1][2].get("params", {}).get("arguments") == {"datasetId": "ds2"},
       (res, received[-1:]))
+
+
+def json_of(text):
+    """What ToolResult(text).json() gives, or 'ValueError: <text>' when it raises one, else what happened instead."""
+    try:
+        return domino_agui.ToolResult(text).json()
+    except ValueError as e:
+        return f"ValueError: {e}"
+    except Exception as e:
+        return f"not a ValueError: {type(e).__name__}: {e}"
+
+
+# run_job's answer as the agent service gives it: Domino's JSON, then a note for the model after a blank line
+RUN_JOB = '{"job":{"id":"j-1","status":"Queued"}}\n\n[Saved 1 changed file(s) to the project first, so the job has them: main.py]'
+got = [res.json(), json_of(RUN_JOB), json_of('  [{"id": "b-1"}]\n'), json_of('"done"')]
+check("ToolResult.json(): the JSON at the start of the answer's text, also when a note follows it (the relay's second text part, or "
+      "the note that run_job adds); any JSON value", got == [{"id": "ds2"}, {"job": {"id": "j-1", "status": "Queued"}}, [{"id": "b-1"}], "done"],
+      got)
+got = [json_of("The dataset ds-1 has 3 files."), json_of(""), json_of('{"data": [{"id": "b-1"}, {"id": "b-... [truncated: 40000 characters]'),
+       json_of("3 rows"), json_of('{"id": "b-1"} and more')]
+check("ToolResult.json(): an answer with no JSON at its start (a text, an empty answer, an answer that the gateway cut, a text that "
+      "starts with a number, JSON with more text on its line) raises a ValueError that says so and shows the answer's start",
+      all(isinstance(g, str) and g.startswith("ValueError: ") and "not JSON" in g for g in got)
+      and "The dataset ds-1 has 3 files." in got[0] and '{"data": [{"id": "b-1"}' in got[2] and "3 rows" in got[3], got)
 res = asyncio.run(relay.call("write_dataset_description", {"datasetId": "ds1", "description": "Alerts"}))
 check("a result with isError (a denied call) comes back as a ToolResult with is_error and the server's text, not as an exception",
       res == domino_agui.ToolResult("write_dataset_description was denied: the dataset is read-only", True), res)
+got = (asyncio.run(contract.gateway_call("get_dataset", {"datasetId": "ds3"})), received[-1],
+       asyncio.run(contract.gateway_call("write_dataset_description", '{"datasetId": "ds3", "description": "Alerts"}')))
+check("contract.gateway_call(name, arguments): a gateway tool call from the agent's own code, through the Job's relay "
+      "($AGENT_SERVICE_URL, $SESSION_TOKEN): the relay's ToolResult, and a denial is a result with is_error",
+      got[0] == domino_agui.ToolResult('{"id": "ds3"}\n1 row') and without_id([got[1]]) == [
+          ("/mcp", f"Bearer {TOKEN}", {"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "get_dataset", "arguments": {"datasetId": "ds3"}}})]
+      and got[2] == domino_agui.ToolResult("write_dataset_description was denied: the dataset is read-only", True), got)
+
+
+def json_call(name, arguments):
+    """What contract.call_json() gives, or '<the exception's class>: <text>' when it raises (a ToolError with its name and result)."""
+    try:
+        return asyncio.run(contract.call_json(name, arguments))
+    except Exception as e:
+        return f"{type(e).__name__}: {e}" + (f" | {e.name} | {e.result!r}" if isinstance(e, getattr(contract, "ToolError", ())) else "")
+
+
+got = [json_call("get_dataset", {"datasetId": "ds4"}), json_call("get_dataset", '{"datasetId": "ds5"}')]
+check("contract.call_json(name, arguments): a gateway call that gives the JSON of the answer (the note after it is left out)",
+      got == [{"id": "ds4"}, {"id": "ds5"}] and received[-1][2]["params"] == {"name": "get_dataset", "arguments": {"datasetId": "ds5"}}, got)
+why = json_call("write_dataset_description", {"datasetId": "ds4", "description": "Alerts"})
+check("contract.call_json: an answer with is_error (a denial, a failed call) raises contract.ToolError, a RuntimeError, that names the "
+      "tool and gives the gateway's text; e.name is the tool and e.result its ToolResult",
+      issubclass(getattr(contract, "ToolError", object), RuntimeError) and why.startswith("ToolError: ")
+      and why.count("write_dataset_description was denied: the dataset is read-only") == 2
+      and why.endswith(" | write_dataset_description | " + repr(domino_agui.ToolResult("write_dataset_description was denied: the dataset is "
+                                                                                       "read-only", True))), why)
+why = json_call("count_rows", {})
+check("contract.call_json: an answer that isn't JSON raises a ValueError that names the tool and shows the answer",
+      why.startswith("ValueError: ") and "count_rows" in why and "3 rows" in why and "not JSON" in why, why)
 before = len(received)
 bad = [asyncio.run(relay.call("get_dataset", a)) for a in ('{"datasetId": ', '["ds1"]')]
 check("arguments that are not a JSON object: an error result that tells the model to send a JSON object, and no request goes out",
@@ -971,6 +1136,12 @@ check("a server that can't be reached (nothing listens) raises RelayError that n
       why.startswith("RelayError: ") and f"http://127.0.0.1:{closed_port}/mcp" in why and "can't be reached" in why, why)
 for k in ("AGENT_SERVICE_URL", "SESSION_TOKEN"):
     os.environ.pop(k)
+why = [relay_error(lambda: contract.gateway_call("get_bundle", {"bundleId": "b1"})),
+       relay_error(lambda: contract.call_json("get_bundle", {"bundleId": "b1"}))]
+check("outside a Job (no $AGENT_SERVICE_URL: a laptop, a unit test), contract.gateway_call() and call_json() raise RelayError, a "
+      "RuntimeError, that names AGENT_SERVICE_URL (not an AttributeError), and relay() is still None",
+      all(w.startswith("RelayError: ") and "AGENT_SERVICE_URL" in w for w in why) and issubclass(domino_agui.RelayError, RuntimeError)
+      and contract.relay() is None, why)
 why = relay_error(lambda: domino_agui.Relay().list_tools())
 check("with no $AGENT_SERVICE_URL and no $SESSION_TOKEN (outside a Job), making the client raises RelayError that names both and says "
       "to give url= and token=", why.startswith("RelayError: ") and "AGENT_SERVICE_URL and SESSION_TOKEN" in why
