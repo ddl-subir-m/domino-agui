@@ -681,13 +681,13 @@ got = [convert.from_openai(cut(openai_completion("The report is cu"), finish_rea
 check("from_openai: answer.at_limit is True for finish_reason length (the SDK's object too), False for stop and tool_calls",
       got == [True, True, False, False], got)
 check("convert.Answer(text) is a finished answer unless it says so: at_limit is False", convert.Answer("Done").at_limit is False)
-check("contract.EMPTY_ANSWER is the message that the ready-made LangGraph agent and the loop give the model, one time in a run, after "
-      "an answer with no text and no tool call", contract.EMPTY_ANSWER == "Your last answer was empty. Continue with the task, or give "
-      "your result.", contract.EMPTY_ANSWER)
-check("contract.AT_LIMIT is the run's result when the model's last answer stopped at the output limit: it says that the answer is not "
-      "finished, and how to give the model more room", contract.AT_LIMIT == "The model's last answer stopped at its output limit, so it "
-      "is not a finished answer. To give the model a larger limit, set AGENT_MAX_TOKENS, or max_tokens on the agent's own model.",
-      contract.AT_LIMIT)
+check("contract.EMPTY_ANSWER is the message that the ready-made LangGraph agent and the loop give the model, one time in an AG-UI run, "
+      "after an answer with no text and no tool call", contract.EMPTY_ANSWER == "Your last answer was empty. Continue with the task, or "
+      "give your result.", contract.EMPTY_ANSWER)
+check("contract.AT_LIMIT starts the AG-UI run's result when the model's last answer stopped at the output limit: it says that the "
+      "answer is not finished, and how to give the model more room",
+      contract.AT_LIMIT == "The model's last answer stopped at its output limit, so it is not a finished answer. To give the model a "
+      "larger limit, set AGENT_MAX_TOKENS, or max_tokens on the agent's own model.", contract.AT_LIMIT)
 
 # --- the agent contract's shared parts: each ready-made agent, and an author's own graph, flow or loop, uses them the same way on
 #     every framework. The expected values are written out: a model reads these texts, so a change to one is a change to the contract

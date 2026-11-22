@@ -49,9 +49,9 @@ ONE_QUESTION = "Ask one question at a time: ask this again once you have the ans
 # The message that the ready-made LangGraph agent and the loop give the model after an answer with no text and no tool call, one time
 # in a run, as a user message. A second empty answer ends the run. (CrewAI's flow doesn't send it.)
 EMPTY_ANSWER = "Your last answer was empty. Continue with the task, or give your result."
-# The run's result, as its last text, when the model's last answer stopped at the output limit (MAX_TOKENS, or the limit of the
-# author's own model): the answer isn't finished, so the result says so, and says how to give the model more room. The ready-made
-# LangGraph agent and the loop send it
+# The note at the start of the run's result when the model's last answer stopped at the output limit (MAX_TOKENS, or the limit of the
+# author's own model). The answer isn't finished, so the result says so first, and says how to give the model more room. A blank line
+# and the cut text come after it (_cut_result). The ready-made LangGraph agent and the loop send it
 AT_LIMIT = ("The model's last answer stopped at its output limit, so it is not a finished answer. To give the model a larger limit, "
             "set AGENT_MAX_TOKENS, or max_tokens on the agent's own model.")
 # The relay client's timeouts, in seconds: to connect, then for each answer. A relay call can stay open for up to 45 s, so the time
@@ -79,6 +79,12 @@ def _max_tokens():
 # LangGraph module's chat_model() and the CrewAI flow's litellm_arguments()), unless the author's own model or option sets one. A model
 # with no limit can get a small default (4,096 for an alias with no model profile), which cuts a long answer
 MAX_TOKENS = _max_tokens()
+
+
+def _cut_result(text):
+    """The run's last text when the model's last answer stopped at the output limit: AT_LIMIT, a blank line, then the cut text. So
+    the task's result says first that the answer isn't finished, and keeps the partial answer. AT_LIMIT alone when there is no text."""
+    return f"{AT_LIMIT}\n\n{text}" if text.strip() else AT_LIMIT
 
 
 def _output_limit(options, key="max_tokens"):

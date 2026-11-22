@@ -61,8 +61,8 @@ Each ready-made agent does the same things:
   in a run. When the next answer is empty too, the run ends with no result. The CrewAI flow runs its own model loop, so it has the
   output limit, but not this retry.
 - An answer that stopped at the output limit isn't a finished answer. When the last answer of the LangGraph graph or the loop stopped
-  at the limit, the run's last text, and so the task's result, is `contract.AT_LIMIT`: it says that the answer isn't finished, and
-  how to give the model a larger limit.
+  at the limit, the run's last text, and so the task's result, starts with `contract.AT_LIMIT`. That note says that the answer isn't
+  finished, and how to give the model a larger limit. A blank line and the cut text come after it.
 
 ## The two options: `model=` and `tools=`
 

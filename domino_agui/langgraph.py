@@ -6,7 +6,7 @@
 
 build_graph(checkpointer), which agent() makes, compiles a graph that calls the model and does what each answer asks, until an answer
 has no tool call. After an empty answer (no text, no tool call), it gives the model contract.EMPTY_ANSWER and calls it again, one time in
-an AG-UI run. When the last answer stopped at the output limit, the run's last text is contract.AT_LIMIT. The parts:
+an AG-UI run. When the last answer stopped at the output limit, the run's last text is contract.AT_LIMIT, then the cut text. The parts:
 - chat_model(): the model, for the alias in AGENT_MODEL, in the format of AGENT_MODEL_FORMAT: ChatAnthropic (Anthropic Messages) or
   ChatOpenAI (OpenAI chat completions), with the output limit contract.MAX_TOKENS (chat_model(max_tokens=...) sets another). The base
   URLs and the keys come from the environment that the platform sets;
@@ -332,7 +332,7 @@ def agent(model=None, tools=()):
 
         After an answer with no text and no tool call, contract.EMPTY_ANSWER goes in the state as a user message, so route() calls the
         model again: one time in an AG-UI run (_asked_again). When the last answer stopped at the output limit, it isn't a finished
-        answer: the run's last text, so the task's result, is contract.AT_LIMIT."""
+        answer: the run's last text, so the task's result, is contract.AT_LIMIT, a blank line, then the cut text."""
         names, relay = client_side(state), await relay_tools()
         contract.check_names(own, gateway=[t.name for t in relay], client=names)
         offered = ([t for t in relay if t.name not in names] + [convert.openai_tool(t) for t in state.get("tools") or []]
@@ -343,8 +343,8 @@ def agent(model=None, tools=()):
             return {"messages": [answer]}
         if not (answer.text.strip() or _asked_again(state)):   # an empty answer: route() calls the model again
             return {"messages": [answer, HumanMessage(contract.EMPTY_ANSWER)]}
-        if _at_limit(answer):   # the run's last text says that the answer isn't finished
-            return {"messages": [answer, *(await finish(contract.AT_LIMIT, config))["messages"]]}
+        if _at_limit(answer):   # not a finished answer: the run's last text says so first, then has the cut text
+            return {"messages": [answer, *(await finish(contract._cut_result(answer.text), config))["messages"]]}
         return {"messages": [answer]}
 
     async def call_tools(state):
