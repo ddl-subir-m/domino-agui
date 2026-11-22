@@ -145,10 +145,18 @@ def pending(state):
 
 
 def _asked_again(state):
-    """The graph gave the model contract.EMPTY_ANSWER after the last message of a person: the last user message in the state is it. The
-    ready-made graph asks the model again one time after an empty answer, so at most one time in an AG-UI run."""
-    last = next((m for m in reversed(state["messages"]) if isinstance(m, HumanMessage)), None)
-    return last is not None and last.content == contract.EMPTY_ANSWER
+    """The graph gave the model contract.EMPTY_ANSWER in this AG-UI run, so it doesn't give it again: at most one time in an AG-UI run.
+    The bridge doesn't give the graph the run's ID, so the messages show where the run starts. A run starts with a person's message,
+    with the result of a client-side call (the platform sends it in a new run), or with the reply to ask_human (the resume). The graph
+    makes the other messages in the run: the model's answers, the retry message, and the results of the relay node's calls."""
+    messages, starts = state["messages"], client_side(state) | {contract.ASK_HUMAN}
+    names = {c["id"]: c["name"] for m in messages if isinstance(m, AIMessage) for c in m.tool_calls}
+    for m in reversed(messages):
+        if isinstance(m, HumanMessage):
+            return m.content == contract.EMPTY_ANSWER   # the retry message, or a person's message, which starts the run
+        if isinstance(m, ToolMessage) and names.get(m.tool_call_id) in starts:
+            return False   # a reply or a client-side result: this run starts here, with no retry yet
+    return False
 
 
 def _at_limit(message):
