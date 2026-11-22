@@ -456,12 +456,14 @@ code = ("import sys, asyncio; sys.path.insert(0, sys.argv[1]); import domino_agu
         "asyncio.run(c.call_function(c.system_prompt, {'context': []})); c.own_tools([c.system_prompt]); c.ask_human_arguments('{}'); "
         "c.alias_format(); assert c.relay() is None and asyncio.run(c.call_tool('x', {})).is_error; "
         "domino_agui.convert.openai_tool(c.ASK_HUMAN_TOOL); "
+        "assert c.task([{'description': c.FACTS, 'value': '{\"version\": 1}'}]) == {'version': 1} and domino_agui.ToolResult('{}').json() == {}; "
         "print(domino_agui.__version__); print(sorted(m for m in sys.modules if m.startswith('domino_agui.')))")
 p = subprocess.run([sys.executable, "-I", "-S", "-c", code, LIB,
                                   os.path.join(tempfile.mkdtemp(prefix="agui", dir="/tmp"), "s.sock")], capture_output=True, text=True)
 out = p.stdout.split("\n")
 check("domino_agui imports, starts its server, converts, makes a relay client and uses the contract's parts (the schema builder, the "
-      "name check, an own tool's call and a tool call with no relay too) with the standard library only (python -I -S)", p.returncode == 0 and out[0] == domino_agui.__version__, p.stderr[-500:])
+      "name check, an own tool's call, a tool call with no relay, the task's facts and a tool answer's JSON too) with the standard library "
+      "only (python -I -S)", p.returncode == 0 and out[0] == domino_agui.__version__, p.stderr[-500:])
 check("import domino_agui imports no framework module (domino_agui.langgraph, .crewai, .loop)",
       p.returncode == 0 and not {"domino_agui.langgraph", "domino_agui.crewai", "domino_agui.loop"} & set(json.loads(out[1].replace("'", '"'))),
       out[1:2])
