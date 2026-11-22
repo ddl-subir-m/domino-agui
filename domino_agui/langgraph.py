@@ -52,7 +52,7 @@ try:   # LangGraph first, so that in another framework's image the error names i
     from langchain_mcp_adapters.client import MultiServerMCPClient
     import httpx
     from typing_extensions import TypedDict   # as MessagesState's
-    from langchain_core.callbacks import adispatch_custom_event   # finish(), quiet() and structured()
+    from langchain_core.callbacks import adispatch_custom_event   # this line and the next four: finish() and structured()
     from langchain_core.messages import HumanMessage
     from langchain_core.runnables import RunnableLambda
     from langchain_core.utils.function_calling import convert_to_openai_tool
