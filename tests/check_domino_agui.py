@@ -987,6 +987,28 @@ res = asyncio.run(relay.call("get_dataset", '{"datasetId": "ds2"}'))
 check("relay.call() takes the model's arguments as JSON text too (ToolCall.arguments), and sends them as a JSON object",
       res == domino_agui.ToolResult('{"id": "ds2"}\n1 row') and received[-1][2].get("params", {}).get("arguments") == {"datasetId": "ds2"},
       (res, received[-1:]))
+
+
+def json_of(text):
+    """What ToolResult(text).json() gives, or 'ValueError: <text>' when it raises one, else what happened instead."""
+    try:
+        return domino_agui.ToolResult(text).json()
+    except ValueError as e:
+        return f"ValueError: {e}"
+    except Exception as e:
+        return f"not a ValueError: {type(e).__name__}: {e}"
+
+
+# run_job's answer as the agent service gives it: Domino's JSON, then a note for the model after a blank line
+RUN_JOB = '{"job":{"id":"j-1","status":"Queued"}}\n\n[Saved 1 changed file(s) to the project first, so the job has them: main.py]'
+got = [res.json(), json_of(RUN_JOB), json_of('  [{"id": "b-1"}]\n'), json_of('"done"')]
+check("ToolResult.json(): the JSON at the start of the answer's text, also when a note follows it (the relay's second text part, or "
+      "the note that run_job adds); any JSON value", got == [{"id": "ds2"}, {"job": {"id": "j-1", "status": "Queued"}}, [{"id": "b-1"}], "done"],
+      got)
+got = [json_of("The dataset ds-1 has 3 files."), json_of(""), json_of('{"data": [{"id": "b-1"}, {"id": "b-... [truncated: 40000 characters]')]
+check("ToolResult.json(): an answer with no JSON at its start (a text, an empty answer, an answer that the gateway cut) raises a "
+      "ValueError that says so and shows the answer's start", all(g.startswith("ValueError: ") and "not JSON" in g for g in got)
+      and "The dataset ds-1 has 3 files." in got[0] and '{"data": [{"id": "b-1"}' in got[2], got)
 res = asyncio.run(relay.call("write_dataset_description", {"datasetId": "ds1", "description": "Alerts"}))
 check("a result with isError (a denied call) comes back as a ToolResult with is_error and the server's text, not as an exception",
       res == domino_agui.ToolResult("write_dataset_description was denied: the dataset is read-only", True), res)
