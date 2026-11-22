@@ -29,8 +29,12 @@ sandbox: they aren't gateway tools, so the gateway doesn't decide or audit them.
 
 An author who needs their own nodes builds a graph from these helpers: agent() shows how they fit. This module imports LangGraph when
 it is imported (the core doesn't), so it needs the agent-langgraph Environment's packages. It calls no host at import.
+
+A graph of its own also has:
+- finish(text): a graph whose last node is not a model call gives the task's result with it (the run's last text, streamed).
 """
 import os
+import uuid
 from datetime import timedelta
 from typing import Annotated
 
@@ -41,6 +45,7 @@ contract.require_framework(__name__, "langgraph")   # in another framework's Env
 try:   # LangGraph first, so that in another framework's image the error names it
     from langgraph.graph import END, START, MessagesState, StateGraph
     from langgraph.types import interrupt
+    from langchain_core.callbacks import adispatch_custom_event
     from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
     from langchain_core.tools import BaseTool, StructuredTool, ToolException
     from langchain_mcp_adapters.client import MultiServerMCPClient
@@ -50,11 +55,13 @@ except ImportError as e:
     raise ImportError(f"domino_agui.langgraph needs LangGraph and its packages, and this Python has no {e.name or e}: run the agent on "
                       "the agent-langgraph Environment") from None
 
-__all__ = ["CANCELLED", "State", "agent", "ask_human", "build_graph", "chat_model", "client_side", "own_tool", "pending", "plain_context",
-           "relay_tools", "route", "system_prompt"]
+__all__ = ["CANCELLED", "State", "agent", "ask_human", "build_graph", "chat_model", "client_side", "finish", "own_tool", "pending",
+           "plain_context", "relay_tools", "route", "system_prompt"]
 
 # What interrupt() returns when the platform cancels the question (the bridge's sentinel)
 CANCELLED = "__agui_cancelled__"
+# The bridge's custom event that it streams as one text message (ag-ui-langgraph's CustomEventNames.ManuallyEmitMessage)
+MANUAL_MESSAGE = "manually_emit_message"
 
 _relay = None   # the relay's tools, listed once for each agent server, at the first run (no network at import)
 
@@ -164,6 +171,18 @@ def own_tool(fn):
         return result.text
     return StructuredTool(name=spec["name"], description=spec["description"], args_schema=spec["parameters"], coroutine=call,
                           handle_tool_error=True)
+
+
+async def finish(text, config=None):
+    """The task's result from the graph's own last node, such as a node of plain code with no model call: `text` streamed as the run's
+    last text message, and -> the state's update with that message, {"messages": [AIMessage(text)]}. The task's result is the run's
+    last streamed text, and the bridge doesn't stream a message that a node only puts in the state. So finish() sends the bridge's
+    event manually_emit_message, with the AIMessage's ID: the stream and the state have one message. Await it in the last node, after
+    each model call: `return {**await finish(text), "verdict": verdict}`. `config`: the node's config, which Python 3.10 needs (there,
+    LangChain can't find the node's run without it)."""
+    message_id = f"msg-{uuid.uuid4().hex}"
+    await adispatch_custom_event(MANUAL_MESSAGE, {"message_id": message_id, "message": text}, config=config)
+    return {"messages": [AIMessage(text, id=message_id)]}
 
 
 def agent(model=None, tools=()):

@@ -97,6 +97,34 @@ The model still goes through the Job's model proxy: the base URL and the key com
 `use_responses_api=False`, so that it uses chat completions. To limit the length of an answer, use `max_tokens`. Don't set a
 temperature: a gpt-5 model can refuse a temperature other than 1.
 
+## Your own LangGraph graph
+
+An agent with its own steps builds its own graph from the helpers in `domino_agui.langgraph`: `State`, `system_prompt()`,
+`chat_model()`, `relay_tools()`, and the helper below for a graph's own last node. The entry point has the same shape,
+`build_graph(checkpointer)`.
+
+- **`await finish(text)`** gives the task's result from your own last node, for example a node of plain code with no model call. It
+  streams `text` as the run's last text message, and returns the state's update with the same message: the stream and the state
+  have one message ID. The task's result is that text. On Python 3.10, give the node's config too: `finish(text, config)`.
+
+```python
+from langgraph.graph import END, START, StateGraph
+
+from domino_agui.langgraph import State, finish
+
+
+async def report(state: State):
+    return await finish("Verdict: approve")
+
+
+def build_graph(checkpointer):
+    g = StateGraph(State)
+    g.add_node("report", report)
+    g.add_edge(START, "report")
+    g.add_edge("report", END)
+    return g.compile(checkpointer=checkpointer)
+```
+
 ## A hand-written handler on the core
 
 A handler is `async def handler(run)`. `run` has the AG-UI run's inputs (`run.messages`, the full history; `run.state`;
