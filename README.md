@@ -100,12 +100,14 @@ temperature: a gpt-5 model can refuse a temperature other than 1.
 ## Your own LangGraph graph
 
 An agent with its own steps builds its own graph from the helpers in `domino_agui.langgraph`: `State`, `system_prompt()`,
-`chat_model()`, `relay_tools()`, and the helper below for a graph's own last node. The entry point has the same shape,
-`build_graph(checkpointer)`.
+`chat_model()`, `relay_tools()`, and the helpers below. The entry point has the same shape, `build_graph(checkpointer)`.
 
 - **`await finish(text)`** gives the task's result from your own last node, for example a node of plain code with no model call. It
   streams `text` as the run's last text message, and returns the state's update with the same message: the stream and the state
   have one message ID. The task's result is that text. On Python 3.10, give the node's config too: `finish(text, config)`.
+- **`quiet(runnable)`** keeps the model calls of a runnable (a chat model, or `structured()`) out of the AG-UI stream: no text and
+  no tool call of them is streamed. Use it for a model call whose answer your own code reads. Else the stream shows a tool call that
+  no tool runs. A tool that the runnable runs with a tool call is still streamed.
 
 ```python
 from langgraph.graph import END, START, StateGraph

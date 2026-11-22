@@ -31,7 +31,8 @@ An author who needs their own nodes builds a graph from these helpers: agent() s
 it is imported (the core doesn't), so it needs the agent-langgraph Environment's packages. It calls no host at import.
 
 A graph of its own also has:
-- finish(text): a graph whose last node is not a model call gives the task's result with it (the run's last text, streamed).
+- finish(text): a graph whose last node is not a model call gives the task's result with it (the run's last text, streamed);
+- quiet(runnable): a model call whose answer the graph reads itself stays out of the AG-UI stream.
 """
 import os
 import uuid
@@ -56,7 +57,7 @@ except ImportError as e:
                       "the agent-langgraph Environment") from None
 
 __all__ = ["CANCELLED", "State", "agent", "ask_human", "build_graph", "chat_model", "client_side", "finish", "own_tool", "pending",
-           "plain_context", "relay_tools", "route", "system_prompt"]
+           "plain_context", "quiet", "relay_tools", "route", "system_prompt"]
 
 # What interrupt() returns when the platform cancels the question (the bridge's sentinel)
 CANCELLED = "__agui_cancelled__"
@@ -183,6 +184,15 @@ async def finish(text, config=None):
     message_id = f"msg-{uuid.uuid4().hex}"
     await adispatch_custom_event(MANUAL_MESSAGE, {"message_id": message_id, "message": text}, config=config)
     return {"messages": [AIMessage(text, id=message_id)]}
+
+
+def quiet(runnable):
+    """The runnable, such as a chat model or structured(), with its model calls out of the AG-UI stream: no text and no tool call of
+    them is streamed (the bridge's metadata keys emit-messages and emit-tool-calls, both False). Use it for a model call whose answer
+    the graph's own code reads: a tool call that no tool node runs would stay open in the stream. Its answer is still the runnable's
+    answer, for the node. A tool that the runnable runs with a tool call (it gives a ToolMessage) is still streamed: the bridge reads
+    no key for it."""
+    return runnable.with_config(metadata={"emit-messages": False, "emit-tool-calls": False})
 
 
 def agent(model=None, tools=()):
